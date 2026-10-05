@@ -1,0 +1,70 @@
+# 为「离线 DLSS 5 转换管线 · 采集端」构建 OptiScaler。
+#
+# 与官方 just_build.yml 的区别：
+#   · 不依赖 SignPath 签名（fork 仓库里没有 SIGNPATH_API_TOKEN，会失败）
+#   · 不创建 Release，只上传 artifact
+#
+# 产物：
+#   OptiScaler-Capture-Release —— x64\Release\a\ 下的完整运行目录（含 OptiScaler.dll）
+#   CET-optiscaler_capture     —— CET 控制端 Lua 模组
+
+name: Build Capture Mod
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  # 解决方案文件相对仓库根目录的路径（根目录的 OptiScaler.sln）
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        run: msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} ${{ env.SOLUTION_FILE_PATH }} /verbosity:minimal
+
+      - name: Verify build output
+        shell: powershell
+        run: |
+          $dll = Join-Path "${{ github.workspace }}" "x64\Release\a\OptiScaler.dll"
+          if (-Not (Test-Path $dll)) {
+            Write-Error "未找到构建产物: $dll"
+            Write-Host "--- x64\Release 目录树 ---"
+            if (Test-Path "${{ github.workspace }}\x64\Release") {
+              Get-ChildItem "${{ github.workspace }}\x64\Release" -Recurse |
+                Select-Object -First 100 FullName
+            } else {
+              Write-Host "(x64\Release 不存在)"
+            }
+            exit 1
+          }
+          Write-Host "构建成功:"
+          Get-ChildItem "${{ github.workspace }}\x64\Release\a" | Select-Object Name, Length
+
+      - name: Upload OptiScaler (Capture build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OptiScaler-Capture-Release
+          path: x64/Release/a/**
+          if-no-files-found: error
+
+      - name: Upload CET mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: CET-optiscaler_capture
+          path: cet-mod/**
+          if-no-files-found: error

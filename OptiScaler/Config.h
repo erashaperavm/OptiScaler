@@ -670,6 +670,17 @@ class Config
     CustomOptional<bool> EnableFsr3Inputs { true };
     CustomOptional<bool> EnableFfxInputs { true };
 
+    // DLSS 输入捕获（离线 DLSS 5 转换管线 · 采集端）
+    // Enabled 默认 false：关闭时不启动后台轮询线程，对正常超分路径零影响。
+    // 即使 Enabled=true，也必须在游戏内通过 CET 命令 START 才会真正开始采集。
+    CustomOptional<bool> CaptureEnabled { false };
+    CustomOptional<int32_t> CaptureFrameStride { 2 };  // 每 N 帧采集 1 帧
+    CustomOptional<int32_t> CaptureMaxFrames { 0 };    // 0 = 不限制
+    CustomOptional<bool> CaptureColor { true };
+    CustomOptional<bool> CaptureDepth { true };
+    CustomOptional<bool> CaptureMotion { true };
+    CustomOptional<bool> CaptureExposure { false };
+
     // Framerate
     CustomOptional<float> FramerateLimit { 0.0f };
 

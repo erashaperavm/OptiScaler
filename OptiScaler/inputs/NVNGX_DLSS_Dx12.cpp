@@ -12,6 +12,7 @@
 #include <framegen/nvngx/Nvngx_FG.h>
 #include "FG/FSR3_Dx12_FG.h"
 #include "FG/Upscaler_Inputs_Dx12.h"
+#include "DlssCapture/DlssCapture.h"
 
 #include <imgui/ImGuiNotify.hpp>
 
@@ -371,6 +372,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
     shutdown = true;
     State::Instance().nvngxDx12Inited = false;
 
+    // 停止捕获后台线程、抽干在途回读并回收资源（未启用时为 no-op）
+    DlssCapture::Shutdown();
+
     D3D12Device = nullptr;
 
     if (const auto feature = State::Instance().currentFeature)
@@ -429,6 +433,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown1(ID3D12Device* InDevice)
 {
     shutdown = true;
     State::Instance().nvngxDx12Inited = false;
+
+    // 停止捕获后台线程、抽干在途回读并回收资源（未启用时为 no-op）
+    DlssCapture::Shutdown();
 
     if (State::Instance().activeFgNvngx != FGNvngxReplacement::None)
     {
@@ -1049,6 +1056,31 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
     }
 
     state.currentFeature = feature;
+
+    // ---------------------------------------------------------------------------------
+    // 离线 DLSS 5 转换管线 · 采集端
+    //
+    // 插入位置刻意选在 UpscalerInputsDx12::UpscaleStart 之前：此刻 Color/Depth/MotionVectors
+    // 仍是游戏留下的原始状态，未被 OptiScaler 或帧生成改动过，回读 barrier 才安全。
+    // 默认关闭；未启用时 IsEnabled() 为 false，这里不构造 FrameContext。
+    // ---------------------------------------------------------------------------------
+    if (DlssCapture::IsEnabled())
+    {
+        DlssCapture::FrameContext captureCtx;
+        captureCtx.renderWidth = feature->RenderWidth();
+        captureCtx.renderHeight = feature->RenderHeight();
+        captureCtx.targetWidth = feature->TargetWidth();
+        captureCtx.targetHeight = feature->TargetHeight();
+        captureCtx.engineFrameCount = feature->FrameCount();
+        captureCtx.isHdr = feature->IsHdr();
+        captureCtx.lowResMV = feature->LowResMV();
+        captureCtx.jitteredMV = feature->JitteredMV();
+        captureCtx.depthInverted = feature->DepthInverted();
+        captureCtx.autoExposure = feature->AutoExposure();
+        captureCtx.featureName = feature->Name();
+
+        DlssCapture::OnEvaluate(InCmdList, InParameters, captureCtx);
+    }
 
     // Prepare upscaling inputs
     UpscalerInputsDx12::UpscaleStart(InCmdList, InParameters, feature);

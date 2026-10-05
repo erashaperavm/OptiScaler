@@ -728,6 +728,17 @@ bool Config::Reload(std::filesystem::path iniPath)
             EnableHotSwapping.set_from_config(readBool("Inputs", "EnableHotSwapping"));
         }
 
+        // DLSS 输入捕获（离线 DLSS 5 转换管线 · 采集端）
+        {
+            CaptureEnabled.set_from_config(readBool("Capture", "Enabled"));
+            CaptureFrameStride.set_from_config(readInt("Capture", "FrameStride"));
+            CaptureMaxFrames.set_from_config(readInt("Capture", "MaxFrames"));
+            CaptureColor.set_from_config(readBool("Capture", "CaptureColor"));
+            CaptureDepth.set_from_config(readBool("Capture", "CaptureDepth"));
+            CaptureMotion.set_from_config(readBool("Capture", "CaptureMotion"));
+            CaptureExposure.set_from_config(readBool("Capture", "CaptureExposure"));
+        }
+
         // Plugins
         {
             PluginPath.set_from_config(readWString("Plugins", "Path"));
@@ -1504,6 +1515,24 @@ bool Config::SaveIni()
         ini.SetValue("Inputs", "EnableFsr3Inputs",
                      GetBoolValue(Instance()->EnableFsr3Inputs.value_for_config()).c_str());
         ini.SetValue("Inputs", "EnableFfxInputs", GetBoolValue(Instance()->EnableFfxInputs.value_for_config()).c_str());
+    }
+
+    // DLSS 输入捕获（离线 DLSS 5 转换管线 · 采集端）
+    {
+        ini.SetValue("Capture", "Enabled",
+                     GetBoolValue(Instance()->CaptureEnabled.value_for_config()).c_str());
+        ini.SetValue("Capture", "FrameStride",
+                     GetIntValue(Instance()->CaptureFrameStride.value_for_config()).c_str());
+        ini.SetValue("Capture", "MaxFrames",
+                     GetIntValue(Instance()->CaptureMaxFrames.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureColor",
+                     GetBoolValue(Instance()->CaptureColor.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureDepth",
+                     GetBoolValue(Instance()->CaptureDepth.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureMotion",
+                     GetBoolValue(Instance()->CaptureMotion.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureExposure",
+                     GetBoolValue(Instance()->CaptureExposure.value_for_config()).c_str());
     }
 
     // V-Sync
