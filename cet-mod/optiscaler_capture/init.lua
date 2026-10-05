@@ -17,33 +17,75 @@
 --   1. OptiScaler.ini 的 [Capture] Enabled 设为 true
 --   2. [Hotfix] 的 ColorResourceBarrier / MotionVectorResourceBarrier 已按本游戏设好
 --
--- ── 关于「控制台命令」（重要）──────────────────────────────────────────────
+-- ── 本 mod 提供的入口 ──────────────────────────────────────────────────────
+--   A) 屏幕 HUD（ImGui）
+--      常驻屏幕中轴线顶端（距顶 60 px），鲜绿色长方形底、黑字，显示：
+--        · 状态：捕获中 / 捕获结束 / 待命
+--        · 已捕获秒数、帧数、体积；触顶时显示原因
+--   B) Page Up 键：开始 / 结束采集（在 onDraw 里用 ImGui 检测；若你已在
+--      CET Bindings 页把 OptiCaptureToggle 绑了键，则改由绑定回调触发，避免双触发）
+--   C) 热键（Bindings 页绑定，id 以 OptiCapture 开头）
+--      OptiCaptureToggle / OptiCaptureStart / OptiCaptureStop /
+--      OptiCaptureStatus / OptiCaptureWatch
+--   D) 控制台（尽力而为，取决于 CET 版本，注意带括号）
+--      OptiCaptureToggle() / OptiCaptureStart() / OptiCaptureStop() / ...
+--   E) 完全不用 CET：直接在通信目录手写 command.txt（START / STOP / STATUS）
+--
+-- ── 单次录制上限（本脚本强制）─────────────────────────────────────────────
+--   最长 5 分钟，或落盘 50 GiB，先到先停（自动发 STOP）。
+--
+-- ── 关于「控制台命令」──────────────────────────────────────────────────────
 -- CET 并没有 registerConsoleCommand 这类 API。控制台本质上只是一个 Lua REPL：
 --   · Console.cpp      —— 没有命令表，把输入原样交给 ExecuteLua()
 --   · ScriptContext.cpp —— 只给 mod 注入 registerForEvent / registerHotkey /
 --                          registerInput，且 init.lua 跑完就置 nil
 --   · LuaSandbox.cpp   —— 每个 mod 独立沙箱，控制台是独立的 sandbox 0
 -- 所以「裸敲 OptiCaptureStatus」在 CET 里永远是语法错误，必须带括号。
---
--- 本 mod 提供三种入口：
---   A) 热键（推荐、可靠）
---      已注册 4 个 id，去 CET 覆盖层 → Bindings 页绑定按键：
---        OptiCaptureStart / OptiCaptureStop / OptiCaptureStatus / OptiCaptureWatch
---   B) 控制台（尽力而为，取决于 CET 版本）
---      尝试把函数注入各沙箱共用的回退表，成功则控制台可直接调用：
---        OptiCaptureStatus()      ← 注意括号
---   C) 完全不用 CET
---      OptiScaler 侧只是轮询 command.txt。直接在该目录新建 command.txt，
---      内容写 START / STOP / STATUS 即可（OptiScaler 读完会删掉）。
 -- ============================================================================
 
 local captureDir  = "plugins/cyber_engine_tweaks/mods/optiscaler_capture/"
 local commandFile = captureDir .. "command.txt"
 local statusFile  = captureDir .. "status.json"
 
+-- ── 单次录制上限 ───────────────────────────────────────────────────────────
+local MAX_SECONDS = 300                              -- 5 分钟
+local MAX_BYTES   = 50 * 1024 * 1024 * 1024          -- 50 GiB
+
+-- ── HUD 文案 ───────────────────────────────────────────────────────────────
+-- CET 自带 fonts/NotoSansSC-Regular.otf（简体中文），HUD 可直接显示中文。
+-- 若你的 CET 版本较老、中文显示成方块，把下面三项换成 ASCII：
+--   capturing = "REC" / ended = "DONE" / idle = "READY"
+local TEXT = {
+    capturing = "捕获中",
+    ended     = "捕获结束",
+    idle      = "待命",
+}
+
 local watchEnabled = false
 local watchTimer = 0.0
 local WATCH_INTERVAL = 5.0
+
+-- ── HUD 状态 ───────────────────────────────────────────────────────────────
+local hudVisible = true
+local hudErrorLogged = false
+local hudFlagsCache = nil
+
+-- 从 status.json 读到的捕获状态
+local st = {
+    online = false,
+    state = nil,          -- "capturing" / "idle" / "stopped" / nil
+    frames = 0,
+    dropped = 0,
+    bytes = 0,
+    elapsed = 0.0,        -- 已捕获秒数（本脚本按墙钟累计）
+    everCaptured = false, -- 本进程内是否采集过（用于区分「待命」与「捕获结束」）
+    limitHit = false,
+    limitMessage = nil,
+    prevCapturing = false,
+}
+local intent = false      -- 用户意图：true = 希望正在采集（让 Page Up 即时响应）
+local pollTimer = 0.0
+local POLL_INTERVAL = 0.25
 
 -- ---------------------------------------------------------------------------
 -- 底层：发命令 / 读状态
@@ -134,15 +176,77 @@ local function printStatus()
 end
 
 -- ---------------------------------------------------------------------------
+-- 状态轮询 + 上限强制
+-- ---------------------------------------------------------------------------
+local function refreshStatus()
+    local raw = readStatus()
+    if not raw then
+        st.online = false
+        return
+    end
+    st.online = true
+    st.state = jsonField(raw, "state")
+    st.frames = tonumber(jsonField(raw, "captured_frames")) or 0
+    st.dropped = tonumber(jsonField(raw, "dropped_frames")) or 0
+    st.bytes = tonumber(jsonField(raw, "bytes_written")) or 0
+end
+
+local function updateCaptureState(dt)
+    pollTimer = pollTimer + dt
+    if pollTimer >= POLL_INTERVAL then
+        pollTimer = 0.0
+        refreshStatus()
+    end
+
+    local nowCapturing = (st.state == "capturing")
+
+    -- 新会话开始：重置计时
+    if nowCapturing and not st.prevCapturing then
+        st.elapsed = 0.0
+        st.everCaptured = true
+        st.limitHit = false
+        st.limitMessage = nil
+    end
+
+    -- 用真实状态校正用户意图
+    if nowCapturing then
+        intent = true
+    elseif st.prevCapturing then
+        intent = false
+    end
+    st.prevCapturing = nowCapturing
+
+    if nowCapturing then
+        st.elapsed = st.elapsed + dt
+
+        if not st.limitHit then
+            if st.elapsed >= MAX_SECONDS then
+                st.limitHit = true
+                st.limitMessage = string.format("已达 %.0f 分钟上限，自动停止", MAX_SECONDS / 60.0)
+                sendCommand("STOP")
+                print("[OptiScaler Capture] " .. st.limitMessage)
+            elseif st.bytes >= MAX_BYTES then
+                st.limitHit = true
+                st.limitMessage = string.format("已达 %.0f GB 上限，自动停止", MAX_BYTES / (1024.0 * 1024.0 * 1024.0))
+                sendCommand("STOP")
+                print("[OptiScaler Capture] " .. st.limitMessage)
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- 动作实现
 -- ---------------------------------------------------------------------------
 local function cmdStart()
+    intent = true
     if sendCommand("START") then
         print("[OptiScaler Capture] 已发送 START，将在下一个 DLSS 求值帧开始采集")
     end
 end
 
 local function cmdStop()
+    intent = false
     if sendCommand("STOP") then
         print("[OptiScaler Capture] 已发送 STOP")
     end
@@ -163,13 +267,172 @@ local function cmdWatch()
     end
 end
 
+-- 开始 / 结束（Page Up 与 OptiCaptureToggle 都走这里）
+local function toggleCapture()
+    intent = not intent
+    if intent then
+        sendCommand("START")
+        print("[OptiScaler Capture] 开始采集")
+    else
+        sendCommand("STOP")
+        print("[OptiScaler Capture] 停止采集")
+    end
+    refreshStatus()
+end
+
 -- ---------------------------------------------------------------------------
--- A) 热键注册
+-- ImGui HUD
+-- ---------------------------------------------------------------------------
+-- 兼容两种枚举表示：数值（可直接 |）或 sol 枚举对象（已重载 |）。都失败时退回 +。
+local function OR(a, b)
+    if a == nil then return b end
+    if b == nil then return a end
+    local ok, v = pcall(function() return a | b end)
+    if ok and v ~= nil then return v end
+    local ok2, v2 = pcall(function() return a + b end)
+    if ok2 and v2 ~= nil then return v2 end
+    return a
+end
+
+local function getHudFlags()
+    if hudFlagsCache ~= nil then
+        return hudFlagsCache
+    end
+    if ImGuiWindowFlags == nil then
+        hudFlagsCache = 0
+        return hudFlagsCache
+    end
+    local flags = {
+        ImGuiWindowFlags.NoTitleBar,
+        ImGuiWindowFlags.NoResize,
+        ImGuiWindowFlags.NoMove,
+        ImGuiWindowFlags.NoScrollbar,
+        ImGuiWindowFlags.NoSavedSettings,
+        ImGuiWindowFlags.NoInputs,
+        ImGuiWindowFlags.AlwaysAutoResize,
+        ImGuiWindowFlags.NoFocusOnAppearing,
+        ImGuiWindowFlags.NoNav,
+    }
+    local acc = nil
+    for _, v in ipairs(flags) do
+        acc = OR(acc, v)
+    end
+    hudFlagsCache = acc or 0
+    return hudFlagsCache
+end
+
+-- PushStyleColor / PushStyleVar / SetNextWindowPos 的参数形式随 sol_ImGui 版本而异
+-- （4 个 float 还是 ImVec4；ImVec2 还是散装 float）。这里两种都试，并记录实际压栈数量，
+-- 保证 Pop 数量匹配，避免 ImGui 断言。
+local pushedStyleVars = 0
+local pushedStyleColors = 0
+
+local function pushStyleColorSafe(idx, r, g, b, a)
+    local ok = pcall(function() ImGui.PushStyleColor(idx, r, g, b, a) end)
+    if not ok then
+        ok = pcall(function() ImGui.PushStyleColor(idx, ImVec4(r, g, b, a)) end)
+    end
+    if ok then pushedStyleColors = pushedStyleColors + 1 end
+end
+
+local function pushStyleVarSafe(idx, a, b)
+    local ok
+    if b ~= nil then
+        ok = pcall(function() ImGui.PushStyleVar(idx, ImVec2(a, b)) end)
+        if not ok then ok = pcall(function() ImGui.PushStyleVar(idx, a, b) end) end
+    else
+        ok = pcall(function() ImGui.PushStyleVar(idx, a) end)
+    end
+    if ok then pushedStyleVars = pushedStyleVars + 1 end
+end
+
+local function setNextWindowPosSafe(x, y, px, py)
+    if not pcall(function() ImGui.SetNextWindowPos(ImVec2(x, y), ImGuiCond.Always, ImVec2(px, py)) end) then
+        pcall(function() ImGui.SetNextWindowPos(x, y, ImGuiCond.Always, px, py) end)
+    end
+end
+
+local function drawHud()
+    if ImGui == nil or ImGui.GetIO == nil then
+        return
+    end
+
+    local io = ImGui.GetIO()
+    if io == nil or io.DisplaySize == nil then
+        return
+    end
+    local displayW = io.DisplaySize.x or 1920.0
+
+    -- 中轴线顶端，距顶 60 px；pivot=(0.5,0) 让窗口水平居中
+    setNextWindowPosSafe(displayW * 0.5, 60.0, 0.5, 0.0)
+
+    -- 鲜绿色底、黑字
+    pushedStyleColors = 0
+    pushedStyleVars = 0
+    pushStyleColorSafe(ImGuiCol.WindowBg, 0.06, 0.92, 0.12, 0.88)
+    pushStyleColorSafe(ImGuiCol.Text, 0.02, 0.06, 0.02, 1.0)
+    pushStyleVarSafe(ImGuiStyleVar.WindowPadding, 10.0, 6.0)
+    pushStyleVarSafe(ImGuiStyleVar.WindowRounding, 6.0)
+    pushStyleVarSafe(ImGuiStyleVar.WindowBorderSize, 0.0)
+
+    ImGui.Begin("##opti_capture_hud", getHudFlags())
+
+    local label
+    if st.state == "capturing" then
+        label = TEXT.capturing
+    elseif st.everCaptured then
+        label = TEXT.ended
+    else
+        label = TEXT.idle
+    end
+
+    ImGui.Text(string.format("%s   %.1f s", label, st.elapsed))
+    ImGui.Text(string.format("%d frames · %s", st.frames, formatBytes(st.bytes)))
+    if st.limitMessage ~= nil then
+        ImGui.Text(st.limitMessage)
+    elseif not st.online then
+        ImGui.Text("status.json 未就绪")
+    end
+
+    ImGui.End()
+
+    if pushedStyleVars > 0 then
+        ImGui.PopStyleVar(pushedStyleVars)
+    end
+    if pushedStyleColors > 0 then
+        ImGui.PopStyleColor(pushedStyleColors)
+    end
+end
+
+-- Page Up：若用户已把 OptiCaptureToggle 绑了键，就交给绑定回调（避免一次按键触发两次）
+local function checkPageUp()
+    if ImGui == nil or ImGuiKey == nil or ImGui.IsKeyPressed == nil then
+        return
+    end
+    if ImGuiKey.PageUp == nil then
+        return
+    end
+    if IsBound ~= nil and IsBound("OptiCaptureToggle") then
+        return
+    end
+
+    local ok, pressed = pcall(ImGui.IsKeyPressed, ImGuiKey.PageUp, false)
+    if not ok then
+        ok, pressed = pcall(ImGui.IsKeyPressed, ImGuiKey.PageUp)
+    end
+    if ok and pressed then
+        toggleCapture()
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- 热键注册
 -- 必须在 init.lua「加载期间」调用：CET 会在 init.lua 执行完后把
 -- registerForEvent / registerHotkey / registerInput 置为 nil。
 -- 绑定位置：CET 覆盖层 → Bindings 页，找 id 以 OptiCapture 开头的项。
 -- ---------------------------------------------------------------------------
 if registerHotkey then
+    registerHotkey("OptiCaptureToggle", "OptiScaler Capture: 开始/结束（Page Up）", toggleCapture)
     registerHotkey("OptiCaptureStart",  "OptiScaler Capture: 开始采集", cmdStart)
     registerHotkey("OptiCaptureStop",   "OptiScaler Capture: 停止采集", cmdStop)
     registerHotkey("OptiCaptureStatus", "OptiScaler Capture: 查询状态", cmdStatus)
@@ -177,7 +440,7 @@ if registerHotkey then
 end
 
 -- ---------------------------------------------------------------------------
--- B) 尽力把命令注入控制台
+-- 尽力把命令注入控制台
 -- CET 每个沙箱有自己的 env，env 的 metatable.__index 指向一张共享回退表；
 -- 控制台沙箱也走同一张表。把函数 rawset 进去，控制台就有机会看到。
 -- 依赖 CET 内部实现，可能失效；失败则退化为「只用热键 / 手写 command.txt」。
@@ -193,6 +456,7 @@ local function exposeToConsole()
     local shared = mt.__index
     if type(shared) ~= "table" then return false end
 
+    rawset(shared, "OptiCaptureToggle", toggleCapture)
     rawset(shared, "OptiCaptureStart",  cmdStart)
     rawset(shared, "OptiCaptureStop",   cmdStop)
     rawset(shared, "OptiCaptureStatus", cmdStatus)
@@ -205,33 +469,52 @@ pcall(function() consoleExposed = exposeToConsole() end)
 
 registerForEvent("onInit", function()
     print("[OptiScaler Capture] CET 端已加载。")
+    print(string.format("[OptiScaler Capture] HUD 常驻屏幕顶端；Page Up 开始/结束；单次上限 %d 分钟 / %.0f GB",
+        MAX_SECONDS / 60, MAX_BYTES / (1024.0 * 1024.0 * 1024.0)))
     if consoleExposed then
-        print("[OptiScaler Capture] 控制台可用（记得带括号）：OptiCaptureStart() / OptiCaptureStop() / OptiCaptureStatus() / OptiCaptureWatch()")
+        print("[OptiScaler Capture] 控制台可用（记得带括号）：OptiCaptureToggle() / OptiCaptureStart() / OptiCaptureStop() / OptiCaptureStatus() / OptiCaptureWatch()")
     else
-        print("[OptiScaler Capture] 控制台注入不可用；请用热键（Bindings 页绑定 OptiCapture*），或直接手写 command.txt")
+        print("[OptiScaler Capture] 控制台注入不可用；请用 Page Up 或热键（Bindings 页绑定 OptiCapture*），或直接手写 command.txt")
     end
 end)
 
 -- ---------------------------------------------------------------------------
--- 可选的自动状态轮询
+-- 每帧：状态轮询 + 上限 + 可选自动状态打印
 -- ---------------------------------------------------------------------------
 registerForEvent("onUpdate", function(deltaTime)
-    if not watchEnabled then
-        return
-    end
+    local dt = deltaTime or 0.0
+    updateCaptureState(dt)
 
-    watchTimer = watchTimer + deltaTime
-    if watchTimer < WATCH_INTERVAL then
-        return
+    if watchEnabled then
+        watchTimer = watchTimer + dt
+        if watchTimer >= WATCH_INTERVAL then
+            watchTimer = 0.0
+            printStatus()
+        end
     end
+end)
 
-    watchTimer = 0.0
-    printStatus()
+-- ---------------------------------------------------------------------------
+-- 每帧：HUD + Page Up
+-- ImGui 只能在 onDraw 里调用；若某步失败，捕获功能不受影响。
+-- ---------------------------------------------------------------------------
+registerForEvent("onDraw", function()
+    pcall(checkPageUp)
+
+    if hudVisible then
+        local ok = pcall(drawHud)
+        if not ok and not hudErrorLogged then
+            hudErrorLogged = true
+            print("[OptiScaler Capture] HUD 绘制失败：CET 的 ImGui API 与预期不符（将不再重复提示）。" ..
+                  "捕获功能不受影响，Page Up 仍可用。")
+        end
+    end
 end)
 
 -- init.lua 的返回值会成为本 mod 的对象；控制台里可尝试：
 --   GetMod("optiscaler_capture"):Status()
 return {
+    Toggle = toggleCapture,
     Start  = cmdStart,
     Stop   = cmdStop,
     Status = cmdStatus,

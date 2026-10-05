@@ -1239,7 +1239,8 @@ class CaptureEngine
         std::filesystem::path sessionDir;
 
         nlohmann::json manifest;
-        manifest["capture_version"] = 1;
+        // 2 = Compact 落盘契约（*_format 记落盘格式，*_source_format 记源格式）
+        manifest["capture_version"] = 2;
 
         {
             std::lock_guard<std::mutex> lock(_stateMutex);
