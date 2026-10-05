@@ -8,7 +8,10 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +21,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 // =====================================================================================
 // DLSS 输入捕获层
@@ -200,6 +204,73 @@ const char* FormatName(DXGI_FORMAT format)
     default:
         return "DXGI_FORMAT_OTHER";
     }
+}
+
+// binary16 → float，建表一次（与离线 host 的 HalfLut 同源，保证两端解码一致）。
+const float* HalfTable()
+{
+    static const std::vector<float> table = [] {
+        std::vector<float> t(65536);
+        for (int i = 0; i < 65536; ++i)
+        {
+            const uint32_t s = (static_cast<uint32_t>(i) >> 15) & 1u;
+            const uint32_t e = (static_cast<uint32_t>(i) >> 10) & 0x1Fu;
+            const uint32_t m = static_cast<uint32_t>(i) & 0x3FFu;
+            float v;
+            if (e == 0)
+                v = static_cast<float>(m) * 5.9604644775390625e-08f; // 2^-24
+            else if (e == 31)
+                v = (m == 0) ? 3.0e38f : 0.0f;
+            else
+                v = (1.0f + static_cast<float>(m) / 1024.0f) * std::pow(2.0f, static_cast<float>(e) - 15.0f);
+            t[i] = s ? -v : v;
+        }
+        return t;
+    }();
+    return table.data();
+}
+
+// float → DXGI_FORMAT_R11G11B10_FLOAT 的单个字段（无符号浮点，5 位指数 + mantBits 位尾数）。
+// 负数 / 下溢 → 0，上溢 / inf / NaN → 字段最大值。颜色恒为非负，无需符号位。
+uint32_t PackUnsignedFloat(float v, int mantBits)
+{
+    const uint32_t maxField = (0x1Fu << mantBits) | ((1u << mantBits) - 1u);
+    if (!(v > 0.0f))
+        return 0;
+
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t exp = (bits >> 23) & 0xFFu;
+    const uint32_t mant = bits & 0x7FFFFFu;
+
+    if (exp == 0xFFu)
+        return maxField;
+
+    int newExp = static_cast<int>(exp) - 127 + 15;
+    if (newExp <= 0)
+        return 0;
+    if (newExp >= 31)
+        return maxField;
+
+    const int shift = 23 - mantBits;
+    uint32_t rounded = mant + (1u << (shift - 1)); // 四舍五入到 mantBits 位
+    if (rounded & 0x800000u)                       // 尾数进位 → 指数 +1
+    {
+        rounded = 0;
+        if (++newExp >= 31)
+            return maxField;
+    }
+    return (static_cast<uint32_t>(newExp) << mantBits) | (rounded >> shift);
+}
+
+// RGBA16F 的一个像素（R,G,B half）→ 打包的 R11G11B10_FLOAT。
+uint32_t PackR11G11B10(const uint16_t* rgba16)
+{
+    const float* half = HalfTable();
+    const uint32_t r = PackUnsignedFloat(half[rgba16[0]], 6);
+    const uint32_t g = PackUnsignedFloat(half[rgba16[1]], 6);
+    const uint32_t b = PackUnsignedFloat(half[rgba16[2]], 5);
+    return r | (g << 11) | (b << 22);
 }
 
 void TransitionResource(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
@@ -474,9 +545,12 @@ class CaptureEngine
         _channelEnabled[RES_MOTION] = cfg->CaptureMotion.value_or_default();
         _channelEnabled[RES_EXPOSURE] = cfg->CaptureExposure.value_or_default();
 
-        LOG_INFO("[Capture] config: enabled={} stride={} maxFrames={} color={} depth={} motion={} exposure={}",
+        _compact.store(cfg->CaptureCompact.value_or_default(), std::memory_order_relaxed);
+
+        LOG_INFO("[Capture] config: enabled={} stride={} maxFrames={} color={} depth={} motion={} exposure={} compact={}",
                  _enabled, _frameStride.load(), _maxFrames.load(), _channelEnabled[RES_COLOR],
-                 _channelEnabled[RES_DEPTH], _channelEnabled[RES_MOTION], _channelEnabled[RES_EXPOSURE]);
+                 _channelEnabled[RES_DEPTH], _channelEnabled[RES_MOTION], _channelEnabled[RES_EXPOSURE],
+                 _compact.load());
     }
 
     bool IsChannelEnabled(int index) const
@@ -1038,7 +1112,9 @@ class CaptureEngine
             }
 
             UINT64 written = 0;
-            if (!WriteReadbackRows(target, frameDir / kResFileNames[i], written))
+            DXGI_FORMAT onDiskFormat = target.format;
+            UINT onDiskStride = static_cast<UINT>(target.tightRowBytes);
+            if (!WriteReadbackRows(i, target, frameDir / kResFileNames[i], written, onDiskFormat, onDiskStride))
             {
                 frameJson[prefix + "_present"] = false;
                 frameJson[prefix + "_skip_reason"] = "write failed";
@@ -1048,10 +1124,11 @@ class CaptureEngine
             frameBytes += written;
 
             frameJson[prefix + "_present"] = true;
-            frameJson[prefix + "_format"] = FormatName(target.format);
-            frameJson[prefix + "_format_value"] = static_cast<int>(target.format);
+            frameJson[prefix + "_format"] = FormatName(onDiskFormat);
+            frameJson[prefix + "_format_value"] = static_cast<int>(onDiskFormat);
+            frameJson[prefix + "_source_format"] = FormatName(target.format);
             frameJson[prefix + "_row_pitch"] = target.rowPitch;
-            frameJson[prefix + "_tight_stride"] = target.tightRowBytes;
+            frameJson[prefix + "_tight_stride"] = onDiskStride;
             frameJson[prefix + "_rows"] = target.rowCount;
             frameJson[prefix + "_bytes"] = written;
             frameJson[prefix + "_layout"] = "tight";
@@ -1071,7 +1148,12 @@ class CaptureEngine
         _bytesWritten.fetch_add(frameBytes, std::memory_order_relaxed);
     }
 
-    bool WriteReadbackRows(const ReadbackTarget& target, const std::filesystem::path& path, UINT64& written)
+    // 把回读缓冲按 tight 行写盘。index 决定通道的压缩策略（Compact=true 且源为 RGBA16F 时）：
+    //   · motion → 只写 RG 两通道（DXGI_FORMAT_R16G16_FLOAT，4 B/px），无损
+    //   · color  → 打包成 DXGI_FORMAT_R11G11B10_FLOAT（4 B/px），保留 HDR
+    // 其余情况原样写出。onDiskFormat / onDiskStride 回报实际落盘格式，写进 frame.json。
+    bool WriteReadbackRows(int index, const ReadbackTarget& target, const std::filesystem::path& path,
+                           UINT64& written, DXGI_FORMAT& onDiskFormat, UINT& onDiskStride)
     {
         void* mapped = nullptr;
         const D3D12_RANGE readRange = { 0, static_cast<SIZE_T>(target.totalBytes) };
@@ -1094,6 +1176,47 @@ class CaptureEngine
         const auto* base = static_cast<const uint8_t*>(mapped);
         const UINT64 tight = target.tightRowBytes > 0 ? target.tightRowBytes : target.rowPitch;
 
+        const bool compact = _compact.load(std::memory_order_relaxed);
+        const bool srcRGBA16 = target.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const bool compactMotion = compact && srcRGBA16 && index == RES_MOTION;
+        const bool compactColor = compact && srcRGBA16 && index == RES_COLOR;
+
+        if (compactMotion || compactColor)
+        {
+            // 源是 RGBA16F：8 B/px，故每行像素数 = tight / 8
+            const size_t pixelsPerRow = static_cast<size_t>(tight) / 8u;
+            std::vector<uint32_t> line(pixelsPerRow);
+
+            for (UINT row = 0; row < target.rowCount; ++row)
+            {
+                const auto* src = reinterpret_cast<const uint16_t*>(base + static_cast<UINT64>(row) * target.rowPitch);
+
+                if (compactMotion)
+                {
+                    for (size_t x = 0; x < pixelsPerRow; ++x)
+                        line[x] = static_cast<uint32_t>(src[x * 4 + 0]) | (static_cast<uint32_t>(src[x * 4 + 1]) << 16);
+                }
+                else
+                {
+                    for (size_t x = 0; x < pixelsPerRow; ++x)
+                        line[x] = PackR11G11B10(&src[x * 4]);
+                }
+
+                out.write(reinterpret_cast<const char*>(line.data()),
+                          static_cast<std::streamsize>(pixelsPerRow * sizeof(uint32_t)));
+            }
+
+            out.close();
+
+            const D3D12_RANGE noWrite = { 0, 0 };
+            target.buffer->Unmap(0, &noWrite);
+
+            onDiskStride = static_cast<UINT>(pixelsPerRow * sizeof(uint32_t));
+            onDiskFormat = compactMotion ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R11G11B10_FLOAT;
+            written = static_cast<UINT64>(target.rowCount) * onDiskStride;
+            return true;
+        }
+
         for (UINT row = 0; row < target.rowCount; ++row)
         {
             const auto* rowPtr = base + static_cast<UINT64>(row) * target.rowPitch;
@@ -1105,6 +1228,8 @@ class CaptureEngine
         const D3D12_RANGE noWrite = { 0, 0 };
         target.buffer->Unmap(0, &noWrite);
 
+        onDiskFormat = target.format;
+        onDiskStride = static_cast<UINT>(tight);
         written = static_cast<UINT64>(target.rowCount) * tight;
         return true;
     }
@@ -1254,6 +1379,7 @@ class CaptureEngine
     // 状态
     // =============================================================================
     bool _enabled = false;
+    std::atomic<bool> _compact { true };
     bool _channelEnabled[kResCount] = { true, true, true, false };
 
     std::atomic<int> _frameStride { 2 };

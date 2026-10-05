@@ -737,6 +737,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             CaptureDepth.set_from_config(readBool("Capture", "CaptureDepth"));
             CaptureMotion.set_from_config(readBool("Capture", "CaptureMotion"));
             CaptureExposure.set_from_config(readBool("Capture", "CaptureExposure"));
+            CaptureCompact.set_from_config(readBool("Capture", "Compact"));
         }
 
         // Plugins
@@ -1527,6 +1528,7 @@ bool Config::SaveIni()
         ini.SetValue("Capture", "CaptureMotion", GetBoolValue(Instance()->CaptureMotion.value_for_config()).c_str());
         ini.SetValue("Capture", "CaptureExposure",
                      GetBoolValue(Instance()->CaptureExposure.value_for_config()).c_str());
+        ini.SetValue("Capture", "Compact", GetBoolValue(Instance()->CaptureCompact.value_for_config()).c_str());
     }
 
     // V-Sync

@@ -680,6 +680,11 @@ class Config
     CustomOptional<bool> CaptureDepth { true };
     CustomOptional<bool> CaptureMotion { true };
     CustomOptional<bool> CaptureExposure { false };
+    // 写盘时压缩已知源格式，显著减小体积：
+    //   motion(RGBA16F) → R16G16_FLOAT（只留 RG，无损）
+    //   color (RGBA16F) → R11G11B10_FLOAT（保留 HDR，每像素 4 字节）
+    // 需要配套的新版离线 host 读取（host 按 frame.json 里的 *_format 自适应）。
+    CustomOptional<bool> CaptureCompact { true };
 
     // Framerate
     CustomOptional<float> FramerateLimit { 0.0f };
