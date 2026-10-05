@@ -16,32 +16,32 @@
 
 namespace DlssCapture
 {
-    // 每帧从 IFeature 提取的上下文。调用方（NVNGX_DLSS_Dx12.cpp）负责填充，
-    // 这样本模块不需要依赖 upscalers/IFeature_Dx12.h。
-    struct FrameContext
-    {
-        unsigned int renderWidth = 0;
-        unsigned int renderHeight = 0;
-        unsigned int targetWidth = 0;
-        unsigned int targetHeight = 0;
-        long engineFrameCount = 0;
+// 每帧从 IFeature 提取的上下文。调用方（NVNGX_DLSS_Dx12.cpp）负责填充，
+// 这样本模块不需要依赖 upscalers/IFeature_Dx12.h。
+struct FrameContext
+{
+    unsigned int renderWidth = 0;
+    unsigned int renderHeight = 0;
+    unsigned int targetWidth = 0;
+    unsigned int targetHeight = 0;
+    long engineFrameCount = 0;
 
-        bool isHdr = false;
-        bool lowResMV = false;
-        bool jitteredMV = false;
-        bool depthInverted = false;
-        bool autoExposure = false;
+    bool isHdr = false;
+    bool lowResMV = false;
+    bool jitteredMV = false;
+    bool depthInverted = false;
+    bool autoExposure = false;
 
-        std::string featureName;
-    };
+    std::string featureName;
+};
 
-    // [Capture] Enabled 为 true 时才返回 true
-    bool IsEnabled();
+// [Capture] Enabled 为 true 时才返回 true
+bool IsEnabled();
 
-    // 在 feature->Evaluate() 之前调用。InCmdList 是游戏正在录制的主命令列表。
-    // 未激活捕获时立即返回。
-    void OnEvaluate(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params, const FrameContext& ctx);
+// 在 feature->Evaluate() 之前调用。InCmdList 是游戏正在录制的主命令列表。
+// 未激活捕获时立即返回。
+void OnEvaluate(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params, const FrameContext& ctx);
 
-    // NGX Shutdown 时调用，停止后台线程并回收资源。
-    void Shutdown();
-}
+// NGX Shutdown 时调用，停止后台线程并回收资源。
+void Shutdown();
+} // namespace DlssCapture

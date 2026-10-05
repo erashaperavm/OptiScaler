@@ -674,8 +674,8 @@ class Config
     // Enabled 默认 false：关闭时不启动后台轮询线程，对正常超分路径零影响。
     // 即使 Enabled=true，也必须在游戏内通过 CET 命令 START 才会真正开始采集。
     CustomOptional<bool> CaptureEnabled { false };
-    CustomOptional<int32_t> CaptureFrameStride { 2 };  // 每 N 帧采集 1 帧
-    CustomOptional<int32_t> CaptureMaxFrames { 0 };    // 0 = 不限制
+    CustomOptional<int32_t> CaptureFrameStride { 2 }; // 每 N 帧采集 1 帧
+    CustomOptional<int32_t> CaptureMaxFrames { 0 };   // 0 = 不限制
     CustomOptional<bool> CaptureColor { true };
     CustomOptional<bool> CaptureDepth { true };
     CustomOptional<bool> CaptureMotion { true };

@@ -42,17 +42,17 @@ jobs:
         run: |
           $dll = Join-Path "${{ github.workspace }}" "x64\Release\a\OptiScaler.dll"
           if (-Not (Test-Path $dll)) {
-            Write-Error "未找到构建产物: $dll"
-            Write-Host "--- x64\Release 目录树 ---"
+            Write-Error "Build output not found: $dll"
+            Write-Host "--- x64\Release tree ---"
             if (Test-Path "${{ github.workspace }}\x64\Release") {
               Get-ChildItem "${{ github.workspace }}\x64\Release" -Recurse |
                 Select-Object -First 100 FullName
             } else {
-              Write-Host "(x64\Release 不存在)"
+              Write-Host "(x64\Release does not exist)"
             }
             exit 1
           }
-          Write-Host "构建成功:"
+          Write-Host "Build OK:"
           Get-ChildItem "${{ github.workspace }}\x64\Release\a" | Select-Object Name, Length
 
       - name: Upload OptiScaler (Capture build)

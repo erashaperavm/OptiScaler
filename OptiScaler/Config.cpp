@@ -1519,18 +1519,12 @@ bool Config::SaveIni()
 
     // DLSS 输入捕获（离线 DLSS 5 转换管线 · 采集端）
     {
-        ini.SetValue("Capture", "Enabled",
-                     GetBoolValue(Instance()->CaptureEnabled.value_for_config()).c_str());
-        ini.SetValue("Capture", "FrameStride",
-                     GetIntValue(Instance()->CaptureFrameStride.value_for_config()).c_str());
-        ini.SetValue("Capture", "MaxFrames",
-                     GetIntValue(Instance()->CaptureMaxFrames.value_for_config()).c_str());
-        ini.SetValue("Capture", "CaptureColor",
-                     GetBoolValue(Instance()->CaptureColor.value_for_config()).c_str());
-        ini.SetValue("Capture", "CaptureDepth",
-                     GetBoolValue(Instance()->CaptureDepth.value_for_config()).c_str());
-        ini.SetValue("Capture", "CaptureMotion",
-                     GetBoolValue(Instance()->CaptureMotion.value_for_config()).c_str());
+        ini.SetValue("Capture", "Enabled", GetBoolValue(Instance()->CaptureEnabled.value_for_config()).c_str());
+        ini.SetValue("Capture", "FrameStride", GetIntValue(Instance()->CaptureFrameStride.value_for_config()).c_str());
+        ini.SetValue("Capture", "MaxFrames", GetIntValue(Instance()->CaptureMaxFrames.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureColor", GetBoolValue(Instance()->CaptureColor.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureDepth", GetBoolValue(Instance()->CaptureDepth.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureMotion", GetBoolValue(Instance()->CaptureMotion.value_for_config()).c_str());
         ini.SetValue("Capture", "CaptureExposure",
                      GetBoolValue(Instance()->CaptureExposure.value_for_config()).c_str());
     }
