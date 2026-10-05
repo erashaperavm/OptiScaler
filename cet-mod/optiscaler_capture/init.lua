@@ -11,19 +11,30 @@
 --     └── status.json   ← OptiScaler 写入，本脚本读取
 --
 -- 捕获输出目录：
---   plugins/cyber_engine_tweaks/mods/optiscaler_capture/capture/session_<时间戳>/
+--   plugins/cyber_engine_tweaks/mods/optiscaler_capture/session_<时间戳>/
 --
 -- 前置条件：
 --   1. OptiScaler.ini 的 [Capture] Enabled 设为 true
---   2. [Hotfix] 的 ColorResourceBarrier / DepthResourceBarrier /
---      MotionVectorResourceBarrier / ExposureResourceBarrier 已按本游戏设置好
---      （捕获层需要知道源资源被复制前所处的状态，未配置的通道会被跳过）
+--   2. [Hotfix] 的 ColorResourceBarrier / MotionVectorResourceBarrier 已按本游戏设好
 --
--- 控制台命令：
---   OptiCaptureStart   开始捕获
---   OptiCaptureStop    停止捕获
---   OptiCaptureStatus  查询一次状态
---   OptiCaptureWatch   开关「捕获中每 5 秒自动打印状态」
+-- ── 关于「控制台命令」（重要）──────────────────────────────────────────────
+-- CET 并没有 registerConsoleCommand 这类 API。控制台本质上只是一个 Lua REPL：
+--   · Console.cpp      —— 没有命令表，把输入原样交给 ExecuteLua()
+--   · ScriptContext.cpp —— 只给 mod 注入 registerForEvent / registerHotkey /
+--                          registerInput，且 init.lua 跑完就置 nil
+--   · LuaSandbox.cpp   —— 每个 mod 独立沙箱，控制台是独立的 sandbox 0
+-- 所以「裸敲 OptiCaptureStatus」在 CET 里永远是语法错误，必须带括号。
+--
+-- 本 mod 提供三种入口：
+--   A) 热键（推荐、可靠）
+--      已注册 4 个 id，去 CET 覆盖层 → Bindings 页绑定按键：
+--        OptiCaptureStart / OptiCaptureStop / OptiCaptureStatus / OptiCaptureWatch
+--   B) 控制台（尽力而为，取决于 CET 版本）
+--      尝试把函数注入各沙箱共用的回退表，成功则控制台可直接调用：
+--        OptiCaptureStatus()      ← 注意括号
+--   C) 完全不用 CET
+--      OptiScaler 侧只是轮询 command.txt。直接在该目录新建 command.txt，
+--      内容写 START / STOP / STATUS 即可（OptiScaler 读完会删掉）。
 -- ============================================================================
 
 local captureDir  = "plugins/cyber_engine_tweaks/mods/optiscaler_capture/"
@@ -123,37 +134,82 @@ local function printStatus()
 end
 
 -- ---------------------------------------------------------------------------
--- 命令注册
+-- 动作实现
 -- ---------------------------------------------------------------------------
+local function cmdStart()
+    if sendCommand("START") then
+        print("[OptiScaler Capture] 已发送 START，将在下一个 DLSS 求值帧开始采集")
+    end
+end
+
+local function cmdStop()
+    if sendCommand("STOP") then
+        print("[OptiScaler Capture] 已发送 STOP")
+    end
+end
+
+local function cmdStatus()
+    sendCommand("STATUS")
+    printStatus()
+end
+
+local function cmdWatch()
+    watchEnabled = not watchEnabled
+    watchTimer = 0.0
+    if watchEnabled then
+        print("[OptiScaler Capture] 自动状态打印已开启")
+    else
+        print("[OptiScaler Capture] 自动状态打印已关闭")
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- A) 热键注册
+-- 必须在 init.lua「加载期间」调用：CET 会在 init.lua 执行完后把
+-- registerForEvent / registerHotkey / registerInput 置为 nil。
+-- 绑定位置：CET 覆盖层 → Bindings 页，找 id 以 OptiCapture 开头的项。
+-- ---------------------------------------------------------------------------
+if registerHotkey then
+    registerHotkey("OptiCaptureStart",  "OptiScaler Capture: 开始采集", cmdStart)
+    registerHotkey("OptiCaptureStop",   "OptiScaler Capture: 停止采集", cmdStop)
+    registerHotkey("OptiCaptureStatus", "OptiScaler Capture: 查询状态", cmdStatus)
+    registerHotkey("OptiCaptureWatch",  "OptiScaler Capture: 开关自动状态打印", cmdWatch)
+end
+
+-- ---------------------------------------------------------------------------
+-- B) 尽力把命令注入控制台
+-- CET 每个沙箱有自己的 env，env 的 metatable.__index 指向一张共享回退表；
+-- 控制台沙箱也走同一张表。把函数 rawset 进去，控制台就有机会看到。
+-- 依赖 CET 内部实现，可能失效；失败则退化为「只用热键 / 手写 command.txt」。
+-- ---------------------------------------------------------------------------
+local function exposeToConsole()
+    local probe = _ENV
+    if type(probe) ~= "table" then probe = _G end
+    if type(probe) ~= "table" then return false end
+
+    local mtOk, mt = pcall(getmetatable, probe)
+    if not mtOk or type(mt) ~= "table" then return false end
+
+    local shared = mt.__index
+    if type(shared) ~= "table" then return false end
+
+    rawset(shared, "OptiCaptureStart",  cmdStart)
+    rawset(shared, "OptiCaptureStop",   cmdStop)
+    rawset(shared, "OptiCaptureStatus", cmdStatus)
+    rawset(shared, "OptiCaptureWatch",  cmdWatch)
+    return true
+end
+
+local consoleExposed = false
+pcall(function() consoleExposed = exposeToConsole() end)
+
 registerForEvent("onInit", function()
-    registerConsoleCommand("OptiCaptureStart", "开始 DLSS 输入资源捕获", function()
-        if sendCommand("START") then
-            print("[OptiScaler Capture] 已发送 START，将在下一个 DLSS 求值帧开始采集")
-        end
-    end)
-
-    registerConsoleCommand("OptiCaptureStop", "停止 DLSS 输入资源捕获", function()
-        if sendCommand("STOP") then
-            print("[OptiScaler Capture] 已发送 STOP")
-        end
-    end)
-
-    registerConsoleCommand("OptiCaptureStatus", "查询 DLSS 输入捕获状态", function()
-        sendCommand("STATUS")
-        printStatus()
-    end)
-
-    registerConsoleCommand("OptiCaptureWatch", "开关捕获中的自动状态打印（每 5 秒）", function()
-        watchEnabled = not watchEnabled
-        watchTimer = 0.0
-        if watchEnabled then
-            print("[OptiScaler Capture] 自动状态打印已开启")
-        else
-            print("[OptiScaler Capture] 自动状态打印已关闭")
-        end
-    end)
-
-    print("[OptiScaler Capture] CET 端已加载。命令：OptiCaptureStart / Stop / Status / Watch")
+    print("[OptiScaler Capture] CET 端已加载。")
+    if consoleExposed then
+        print("[OptiScaler Capture] 控制台可用（记得带括号）：OptiCaptureStart() / OptiCaptureStop() / OptiCaptureStatus() / OptiCaptureWatch()")
+    else
+        print("[OptiScaler Capture] 控制台注入不可用；请用热键（Bindings 页绑定 OptiCapture*），或直接手写 command.txt")
+    end
 end)
 
 -- ---------------------------------------------------------------------------
@@ -172,3 +228,12 @@ registerForEvent("onUpdate", function(deltaTime)
     watchTimer = 0.0
     printStatus()
 end)
+
+-- init.lua 的返回值会成为本 mod 的对象；控制台里可尝试：
+--   GetMod("optiscaler_capture"):Status()
+return {
+    Start  = cmdStart,
+    Stop   = cmdStop,
+    Status = cmdStatus,
+    Watch  = cmdWatch,
+}
