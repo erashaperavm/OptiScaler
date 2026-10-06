@@ -734,10 +734,10 @@ bool Config::Reload(std::filesystem::path iniPath)
             CaptureFrameStride.set_from_config(readInt("Capture", "FrameStride"));
             CaptureMaxFrames.set_from_config(readInt("Capture", "MaxFrames"));
             CaptureColor.set_from_config(readBool("Capture", "CaptureColor"));
-            CaptureDepth.set_from_config(readBool("Capture", "CaptureDepth"));
             CaptureMotion.set_from_config(readBool("Capture", "CaptureMotion"));
-            CaptureExposure.set_from_config(readBool("Capture", "CaptureExposure"));
             CaptureCompact.set_from_config(readBool("Capture", "Compact"));
+            CaptureAudio.set_from_config(readBool("Capture", "CaptureAudio"));
+            CaptureOutputDir.set_from_config(readString("Capture", "OutputDir"));
         }
 
         // Plugins
@@ -1524,11 +1524,10 @@ bool Config::SaveIni()
         ini.SetValue("Capture", "FrameStride", GetIntValue(Instance()->CaptureFrameStride.value_for_config()).c_str());
         ini.SetValue("Capture", "MaxFrames", GetIntValue(Instance()->CaptureMaxFrames.value_for_config()).c_str());
         ini.SetValue("Capture", "CaptureColor", GetBoolValue(Instance()->CaptureColor.value_for_config()).c_str());
-        ini.SetValue("Capture", "CaptureDepth", GetBoolValue(Instance()->CaptureDepth.value_for_config()).c_str());
         ini.SetValue("Capture", "CaptureMotion", GetBoolValue(Instance()->CaptureMotion.value_for_config()).c_str());
-        ini.SetValue("Capture", "CaptureExposure",
-                     GetBoolValue(Instance()->CaptureExposure.value_for_config()).c_str());
         ini.SetValue("Capture", "Compact", GetBoolValue(Instance()->CaptureCompact.value_for_config()).c_str());
+        ini.SetValue("Capture", "CaptureAudio", GetBoolValue(Instance()->CaptureAudio.value_for_config()).c_str());
+        ini.SetValue("Capture", "OutputDir", Instance()->CaptureOutputDir.value_for_config_or("auto").c_str());
     }
 
     // V-Sync

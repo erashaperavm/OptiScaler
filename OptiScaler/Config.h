@@ -676,15 +676,21 @@ class Config
     CustomOptional<bool> CaptureEnabled { false };
     CustomOptional<int32_t> CaptureFrameStride { 2 }; // 每 N 帧采集 1 帧
     CustomOptional<int32_t> CaptureMaxFrames { 0 };   // 0 = 不限制
+    // 只采 color 与 motion —— DLSS 5 NR 模型确证消费的两个输入。
+    // depth / exposure 已移除：模型不消费，且离线 host 分别"只接受 32 位浮点"和"从不读取"。
     CustomOptional<bool> CaptureColor { true };
-    CustomOptional<bool> CaptureDepth { true };
     CustomOptional<bool> CaptureMotion { true };
-    CustomOptional<bool> CaptureExposure { false };
     // 写盘时压缩已知源格式，显著减小体积：
-    //   motion(RGBA16F) → R16G16_FLOAT（只留 RG，无损）
-    //   color (RGBA16F) → R11G11B10_FLOAT（保留 HDR，每像素 4 字节）
+    //   motion(RGBA16F) → R16G16_FLOAT（只留 RG，无损，4 B/px）
+    //   color (RGBA16F) → 8-bit RGB（3 B/px；Reinhard+gamma 在采集端烘焙，与离线 host
+    //                     原本喂模型的值逐位一致 —— 省掉"存 10-bit HDR 却被量化到 8-bit"的白费）
     // 需要配套的新版离线 host 读取（host 按 frame.json 里的 *_format 自适应）。
     CustomOptional<bool> CaptureCompact { true };
+    // 用 WASAPI 环回把「系统/游戏声音」录进 session/audio.wav，与帧序列同一会话起止。
+    CustomOptional<bool> CaptureAudio { true };
+    // 会话输出目录（留空 = 与 mod 目录相同）。写盘吞吐常是采集帧率瓶颈，可指向更快的盘。
+    // 注意：command.txt / status.json 始终留在 mod 目录，CET 才能读写到。
+    CustomOptional<std::string> CaptureOutputDir { "" };
 
     // Framerate
     CustomOptional<float> FramerateLimit { 0.0f };

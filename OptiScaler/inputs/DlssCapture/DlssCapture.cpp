@@ -4,6 +4,12 @@
 #include <dxgi1_4.h>
 #include <json.hpp>
 
+// WASAPI 环回录音（系统/游戏声音）
+#include <audioclient.h>
+#include <mmdeviceapi.h>
+#include <mmreg.h>
+#pragma comment(lib, "ole32.lib")
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -15,6 +21,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -57,21 +64,23 @@ namespace
 constexpr int kRingSize = 6;
 constexpr UINT64 kMarkerBytes = 256;
 
-constexpr int kResCount = 4;
+// 只采 DLSS 5 NR 实际消费的两个输入：color 与 motion。
+// depth / exposure 曾一并采集，但已确认无用：
+//   · 官方口径里 NR 模型的输入只有 color + motion；
+//   · 离线 host 对 depth 只接受 32 位浮点平面（其余格式照采、随后被丢弃退回常量平面）；
+//   · exposure 在 host 的 --capture 路径里从不被读取。
+// 二者合计约占会话体积的 1/3，故移除。
+constexpr int kResCount = 2;
 constexpr int RES_COLOR = 0;
-constexpr int RES_DEPTH = 1;
-constexpr int RES_MOTION = 2;
-constexpr int RES_EXPOSURE = 3;
+constexpr int RES_MOTION = 1;
 
 const char* const kResKeys[kResCount] = {
     NVSDK_NGX_Parameter_Color,
-    NVSDK_NGX_Parameter_Depth,
     NVSDK_NGX_Parameter_MotionVectors,
-    NVSDK_NGX_Parameter_ExposureTexture,
 };
 
-const char* const kResFileNames[kResCount] = { "color.bin", "depth.bin", "motion.bin", "exposure.bin" };
-const char* const kResNames[kResCount] = { "color", "depth", "motion", "exposure" };
+const char* const kResFileNames[kResCount] = { "color.bin", "motion.bin" };
+const char* const kResNames[kResCount] = { "color", "motion" };
 
 enum class SlotState
 {
@@ -230,47 +239,351 @@ const float* HalfTable()
     return table.data();
 }
 
-// float → DXGI_FORMAT_R11G11B10_FLOAT 的单个字段（无符号浮点，5 位指数 + mantBits 位尾数）。
-// 负数 / 下溢 → 0，上溢 / inf / NaN → 字段最大值。颜色恒为非负，无需符号位。
-uint32_t PackUnsignedFloat(float v, int mantBits)
+// -----------------------------------------------------------------------------------------
+// color 落盘 8-bit RGB（3 B/px）
+//
+// 24-bit RGB 没有对应的 DXGI 格式，盘上用 DXGI_FORMAT_FORCE_UINT 作哨兵，名字用
+// kOnDiskRgb8Name（frame.json 的 color_format / color_format_value 都据此写）。
+//
+// 浮点源在这里【烘焙】离线 host 的默认变换（Reinhard + 1/2.2 gamma）——host 拿到就能直接
+// 喂模型，与它现在对 RGBA16F / R11G11B10 的解码结果逐位一致；UNORM 源本就是显示域 SDR，
+// 直接量化（host 今天根本读不了这类盘上格式，所以不存在"逐位一致"的参照）。
+// -----------------------------------------------------------------------------------------
+constexpr DXGI_FORMAT kOnDiskRgb8 = DXGI_FORMAT_FORCE_UINT;
+const char* const kOnDiskRgb8Name = "R8G8B8_UNORM";
+
+// 与离线 host 的 GammaLut() 逐位一致（1024 项，pow(x,1/2.2)*255）
+const uint8_t* Rgb8GammaLut()
 {
-    const uint32_t maxField = (0x1Fu << mantBits) | ((1u << mantBits) - 1u);
-    if (!(v > 0.0f))
-        return 0;
-
-    uint32_t bits = 0;
-    std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t exp = (bits >> 23) & 0xFFu;
-    const uint32_t mant = bits & 0x7FFFFFu;
-
-    if (exp == 0xFFu)
-        return maxField;
-
-    int newExp = static_cast<int>(exp) - 127 + 15;
-    if (newExp <= 0)
-        return 0;
-    if (newExp >= 31)
-        return maxField;
-
-    const int shift = 23 - mantBits;
-    uint32_t rounded = mant + (1u << (shift - 1)); // 四舍五入到 mantBits 位
-    if (rounded & 0x800000u)                       // 尾数进位 → 指数 +1
+    static uint8_t lut[1024];
+    static bool built = false;
+    if (!built)
     {
-        rounded = 0;
-        if (++newExp >= 31)
-            return maxField;
+        built = true;
+        for (int i = 0; i < 1024; ++i)
+            lut[i] =
+                static_cast<uint8_t>(powf(static_cast<float>(i) / 1023.0f, 1.0f / 2.2f) * 255.0f + 0.5f);
     }
-    return (static_cast<uint32_t>(newExp) << mantBits) | (rounded >> shift);
+    return lut;
 }
 
-// RGBA16F 的一个像素（R,G,B half）→ 打包的 R11G11B10_FLOAT。
-uint32_t PackR11G11B10(const uint16_t* rgba16)
+bool Rgb8SourceSupported(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+UINT Rgb8SourceBpp(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8u;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return 4u;
+    default: return 0u;
+    }
+}
+
+// 一行源像素 → 一行 24-bit RGB（R,G,B 顺序，与 host 的 R8G8B8A8 纹理排布一致）
+void PackRowRgb8(const uint8_t* src, size_t pixels, DXGI_FORMAT fmt, uint8_t* dst)
 {
     const float* half = HalfTable();
-    const uint32_t r = PackUnsignedFloat(half[rgba16[0]], 6);
-    const uint32_t g = PackUnsignedFloat(half[rgba16[1]], 6);
-    const uint32_t b = PackUnsignedFloat(half[rgba16[2]], 5);
-    return r | (g << 11) | (b << 22);
+    const uint8_t* gl = Rgb8GammaLut();
+
+    switch (fmt)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    {
+        const auto* s = reinterpret_cast<const uint16_t*>(src);
+        for (size_t x = 0; x < pixels; ++x)
+        {
+            const uint16_t* h = s + x * 4;
+            for (int c = 0; c < 3; ++c)
+            {
+                float v = half[h[c]];
+                if (!(v > 0.0f)) // 负数 / 0 / NaN 一律归零
+                    v = 0.0f;
+                float t = v / (1.0f + v); // 与 host 的 Reinhard 逐位一致
+                if (!(t > 0.0f))
+                    t = 0.0f;
+                if (t > 1.0f)
+                    t = 1.0f;
+                dst[x * 3 + c] = gl[static_cast<int>(t * 1023.0f)];
+            }
+        }
+        break;
+    }
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        for (size_t x = 0; x < pixels; ++x)
+        {
+            dst[x * 3 + 0] = src[x * 4 + 0];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 2];
+        }
+        break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        for (size_t x = 0; x < pixels; ++x)
+        {
+            dst[x * 3 + 0] = src[x * 4 + 2];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 0];
+        }
+        break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    {
+        const auto* s = reinterpret_cast<const uint32_t*>(src);
+        for (size_t x = 0; x < pixels; ++x)
+        {
+            const uint32_t p = s[x];
+            dst[x * 3 + 0] = static_cast<uint8_t>((p & 0x3FFu) * 255u / 1023u);
+            dst[x * 3 + 1] = static_cast<uint8_t>(((p >> 10) & 0x3FFu) * 255u / 1023u);
+            dst[x * 3 + 2] = static_cast<uint8_t>(((p >> 20) & 0x3FFu) * 255u / 1023u);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// =============================================================================
+// WASAPI 环回录音：随捕获会话起止，把系统/游戏声音写成 session/audio.wav
+//
+// 用默认「输出」设备做 loopback 捕获（游戏 + 所有系统声）。共享模式必须使用设备
+// 混音格式；这里原样落盘，只支持最常见的三种：float32 / PCM16 / PCM32，其余格式
+// 记警告并跳过（避免写出坏 WAV）。
+// =============================================================================
+struct AudioCapture
+{
+    std::filesystem::path wavPath;
+    std::atomic<bool> stop { false };
+    std::atomic<bool> ok { false };
+    std::atomic<unsigned long long> frames { 0 }; // 采样帧数（每声道）
+    std::atomic<int> sampleRate { 0 };
+    std::atomic<int> channels { 0 };
+    std::atomic<int> bits { 0 };
+    std::atomic<bool> isFloat { false };
+    std::string formatName;
+};
+
+// 写 44 字节标准 WAV 头（dataBytes 先给 0 占位，结束时用真实大小重写）。
+void WriteWavHeader(std::ostream& os, int rate, int channels, int bits, bool isFloat, uint32_t dataBytes)
+{
+    const uint16_t blockAlign = static_cast<uint16_t>(channels * bits / 8);
+    const uint32_t byteRate = static_cast<uint32_t>(rate) * blockAlign;
+    const uint16_t fmtTag = isFloat ? 3 : 1; // 3 = IEEE_FLOAT, 1 = PCM
+    const uint32_t riffSize = 36u + dataBytes;
+    const uint16_t fmtSize = 16;
+    const uint16_t ch = static_cast<uint16_t>(channels);
+    const uint32_t sr = static_cast<uint32_t>(rate);
+    const uint16_t bps = static_cast<uint16_t>(bits);
+
+    os.write("RIFF", 4);
+    os.write(reinterpret_cast<const char*>(&riffSize), 4);
+    os.write("WAVE", 4);
+    os.write("fmt ", 4);
+    os.write(reinterpret_cast<const char*>(&fmtSize), 4);
+    os.write(reinterpret_cast<const char*>(&fmtTag), 2);
+    os.write(reinterpret_cast<const char*>(&ch), 2);
+    os.write(reinterpret_cast<const char*>(&sr), 4);
+    os.write(reinterpret_cast<const char*>(&byteRate), 4);
+    os.write(reinterpret_cast<const char*>(&blockAlign), 2);
+    os.write(reinterpret_cast<const char*>(&bps), 2);
+    os.write("data", 4);
+    os.write(reinterpret_cast<const char*>(&dataBytes), 4);
+}
+
+void AudioCaptureThread(AudioCapture* cap)
+{
+    const HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioClient* client = nullptr;
+    IAudioCaptureClient* capture = nullptr;
+    WAVEFORMATEX* mix = nullptr;
+    std::ofstream out;
+
+    auto release = [&]() {
+        if (capture != nullptr) capture->Release();
+        if (client != nullptr)
+        {
+            client->Stop();
+            client->Release();
+        }
+        if (device != nullptr) device->Release();
+        if (enumerator != nullptr) enumerator->Release();
+        if (mix != nullptr) CoTaskMemFree(mix);
+        if (SUCCEEDED(coInit)) CoUninitialize();
+    };
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+    if (FAILED(hr) || enumerator == nullptr)
+    {
+        LOG_ERROR("[Capture] audio: MMDeviceEnumerator 创建失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || device == nullptr)
+    {
+        LOG_ERROR("[Capture] audio: 取默认输出设备失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+    if (FAILED(hr) || client == nullptr)
+    {
+        LOG_ERROR("[Capture] audio: IAudioClient 激活失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    hr = client->GetMixFormat(&mix);
+    if (FAILED(hr) || mix == nullptr)
+    {
+        LOG_ERROR("[Capture] audio: GetMixFormat 失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    bool isFloat = false;
+    if (mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+        isFloat = true;
+    else if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT 的 Data1 == 3（省去 ksmedia.h）
+        isFloat = (reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix)->SubFormat.Data1 == 3);
+
+    const int bits = static_cast<int>(mix->wBitsPerSample);
+    const int channels = static_cast<int>(mix->nChannels);
+    const int rate = static_cast<int>(mix->nSamplesPerSec);
+
+    if (!((isFloat && bits == 32) || (!isFloat && (bits == 16 || bits == 32))))
+    {
+        LOG_ERROR("[Capture] audio: 不支持的混音格式 (tag={} bits={} ch={} rate={})，本次不录音",
+                  static_cast<int>(mix->wFormatTag), bits, channels, rate);
+        release();
+        return;
+    }
+
+    hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, mix, nullptr);
+    if (FAILED(hr))
+    {
+        LOG_ERROR("[Capture] audio: IAudioClient::Initialize 失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture));
+    if (FAILED(hr) || capture == nullptr)
+    {
+        LOG_ERROR("[Capture] audio: IAudioCaptureClient 获取失败 (0x{:X})", static_cast<unsigned>(hr));
+        release();
+        return;
+    }
+
+    out.open(cap->wavPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        LOG_ERROR("[Capture] audio: 无法创建 {}", WideToUtf8(cap->wavPath.wstring()));
+        release();
+        return;
+    }
+
+    WriteWavHeader(out, rate, channels, bits, isFloat, 0);
+
+    hr = client->Start();
+    if (FAILED(hr))
+    {
+        LOG_ERROR("[Capture] audio: IAudioClient::Start 失败 (0x{:X})", static_cast<unsigned>(hr));
+        out.close();
+        release();
+        return;
+    }
+
+    cap->sampleRate.store(rate);
+    cap->channels.store(channels);
+    cap->bits.store(bits);
+    cap->isFloat.store(isFloat);
+    cap->formatName = isFloat ? "float32" : (bits == 16 ? "pcm16" : "pcm32");
+    cap->ok.store(true);
+    LOG_INFO("[Capture] audio: 开始录音 {} Hz / {} ch / {} -> {}", rate, channels, cap->formatName,
+             WideToUtf8(cap->wavPath.wstring()));
+
+    uint32_t dataBytes = 0;
+    std::vector<char> zeros(static_cast<size_t>(mix->nBlockAlign) * 1024u, 0);
+
+    while (!cap->stop.load(std::memory_order_relaxed))
+    {
+        UINT32 packet = 0;
+        if (FAILED(capture->GetNextPacketSize(&packet)))
+            break;
+
+        while (packet != 0)
+        {
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr)))
+                break;
+
+            if (frames > 0)
+            {
+                const size_t bytes = static_cast<size_t>(frames) * mix->nBlockAlign;
+                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr)
+                {
+                    size_t left = bytes;
+                    while (left > 0)
+                    {
+                        const size_t n = (std::min)(left, zeros.size());
+                        out.write(zeros.data(), static_cast<std::streamsize>(n));
+                        left -= n;
+                    }
+                }
+                else
+                {
+                    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+                }
+                dataBytes += static_cast<uint32_t>(bytes);
+                cap->frames.fetch_add(frames, std::memory_order_relaxed);
+            }
+
+            capture->ReleaseBuffer(frames);
+            if (FAILED(capture->GetNextPacketSize(&packet)))
+                break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    out.close();
+
+    // 用真实数据量重写文件头
+    {
+        std::fstream fix(cap->wavPath, std::ios::binary | std::ios::in | std::ios::out);
+        if (fix.is_open())
+        {
+            WriteWavHeader(fix, rate, channels, bits, isFloat, dataBytes);
+            fix.close();
+        }
+    }
+
+    LOG_INFO("[Capture] audio: 停止，{} 采样帧（约 {:.2f} 秒）", cap->frames.load(),
+             rate > 0 ? static_cast<double>(cap->frames.load()) / rate : 0.0);
+
+    release();
 }
 
 void TransitionResource(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
@@ -411,6 +724,27 @@ class CaptureEngine
 
         LOG_INFO("[Capture] mod dir: {}", WideToUtf8(_rootDir.wstring()));
 
+        // 会话输出目录：默认与 mod 目录相同；[Capture] OutputDir 可指向更快的盘。
+        // 写盘吞吐常是采集帧率的瓶颈（每帧约 10 MB）。command.txt / status.json
+        // 始终留在 mod 目录，CET 才能读写到。
+        if (_outputDirConfig.empty() || _outputDirConfig == "auto")
+        {
+            _outputDir = _rootDir;
+        }
+        else
+        {
+            std::error_code oec;
+            _outputDir = std::filesystem::u8path(_outputDirConfig);
+            std::filesystem::create_directories(_outputDir, oec);
+            if (oec)
+            {
+                LOG_ERROR("[Capture] can't create OutputDir {}: {}; falling back to the mod dir", _outputDirConfig,
+                          oec.message());
+                _outputDir = _rootDir;
+            }
+        }
+        LOG_INFO("[Capture] session output dir: {}", WideToUtf8(_outputDir.wstring()));
+
         _stop.store(false, std::memory_order_release);
         _worker = std::thread([this] { WorkerLoop(); });
     }
@@ -426,6 +760,8 @@ class CaptureEngine
         if (_worker.joinable())
             _worker.join();
 
+        StopAudio();
+
         DrainSlots(true);
 
         for (Slot& slot : _slots)
@@ -433,6 +769,30 @@ class CaptureEngine
 
         _threadStarted.store(false);
         LOG_INFO("[Capture] stopped. captured={} dropped={}", _capturedFrames.load(), _droppedFrames.load());
+    }
+
+    // =============================================================================
+    // 音频（WASAPI 环回）——只由 worker 线程调用
+    // =============================================================================
+    void StartAudio(const std::filesystem::path& sessionDir)
+    {
+        StopAudio();
+
+        auto cap = std::make_unique<AudioCapture>();
+        cap->wavPath = sessionDir / L"audio.wav";
+        AudioCapture* raw = cap.get();
+        _audio = std::move(cap);
+        _audioThread = std::thread([raw] { AudioCaptureThread(raw); });
+    }
+
+    void StopAudio()
+    {
+        if (_audioThread.joinable())
+        {
+            if (_audio != nullptr)
+                _audio->stop.store(true, std::memory_order_release);
+            _audioThread.join();
+        }
     }
 
     // =============================================================================
@@ -541,16 +901,15 @@ class CaptureEngine
         _maxFrames.store(static_cast<long>(cfg->CaptureMaxFrames.value_or_default()), std::memory_order_relaxed);
 
         _channelEnabled[RES_COLOR] = cfg->CaptureColor.value_or_default();
-        _channelEnabled[RES_DEPTH] = cfg->CaptureDepth.value_or_default();
         _channelEnabled[RES_MOTION] = cfg->CaptureMotion.value_or_default();
-        _channelEnabled[RES_EXPOSURE] = cfg->CaptureExposure.value_or_default();
 
         _compact.store(cfg->CaptureCompact.value_or_default(), std::memory_order_relaxed);
+        _audioEnabled = cfg->CaptureAudio.value_or_default();
+        _outputDirConfig = cfg->CaptureOutputDir.value_or_default();
 
-        LOG_INFO("[Capture] config: enabled={} stride={} maxFrames={} color={} depth={} motion={} exposure={} compact={}",
+        LOG_INFO("[Capture] config: enabled={} stride={} maxFrames={} color={} motion={} compact={}",
                  _enabled, _frameStride.load(), _maxFrames.load(), _channelEnabled[RES_COLOR],
-                 _channelEnabled[RES_DEPTH], _channelEnabled[RES_MOTION], _channelEnabled[RES_EXPOSURE],
-                 _compact.load());
+                 _channelEnabled[RES_MOTION], _compact.load());
     }
 
     bool IsChannelEnabled(int index) const
@@ -573,19 +932,9 @@ class CaptureEngine
                 return static_cast<D3D12_RESOURCE_STATES>(cfg->ColorResourceBarrier.value());
             break;
 
-        case RES_DEPTH:
-            if (cfg->DepthResourceBarrier.has_value())
-                return static_cast<D3D12_RESOURCE_STATES>(cfg->DepthResourceBarrier.value());
-            break;
-
         case RES_MOTION:
             if (cfg->MVResourceBarrier.has_value())
                 return static_cast<D3D12_RESOURCE_STATES>(cfg->MVResourceBarrier.value());
-            break;
-
-        case RES_EXPOSURE:
-            if (cfg->ExposureResourceBarrier.has_value())
-                return static_cast<D3D12_RESOURCE_STATES>(cfg->ExposureResourceBarrier.value());
             break;
 
         default:
@@ -600,7 +949,7 @@ class CaptureEngine
     // =============================================================================
     void BeginSession(const FrameContext& ctx)
     {
-        const std::filesystem::path sessionDir = _rootDir / ("session_" + LocalStampForPath());
+        const std::filesystem::path sessionDir = _outputDir / ("session_" + LocalStampForPath());
 
         std::error_code ec;
         std::filesystem::create_directories(sessionDir, ec);
@@ -628,6 +977,7 @@ class CaptureEngine
         _strideCounter = 0;
         _capturedFrames.store(0, std::memory_order_relaxed);
         _droppedFrames.store(0, std::memory_order_relaxed);
+        _framesWithoutTime.store(0, std::memory_order_relaxed);
         _bytesWritten.store(0, std::memory_order_relaxed);
 
         _capturing.store(true, std::memory_order_release);
@@ -637,6 +987,20 @@ class CaptureEngine
         LOG_INFO("[Capture] session started -> {}", WideToUtf8(sessionDir.wstring()));
         LOG_INFO("[Capture] render {}x{} target {}x{} hdr={} stride={} maxFrames={}", ctx.renderWidth, ctx.renderHeight,
                  ctx.targetWidth, ctx.targetHeight, ctx.isHdr, _frameStride.load(), _maxFrames.load());
+
+        // 预检：启用了但没配 [Hotfix] barrier 的通道会被静默跳过 —— 提前告警，省掉一次白采
+        for (int ch = 0; ch < kResCount; ++ch)
+        {
+            if (!_channelEnabled[ch])
+                continue;
+            if (!OriginalStateFor(ch).has_value())
+                LOG_WARN("[Capture] channel '{}' is enabled but has no [Hotfix] barrier configured; it will be "
+                         "skipped this session (set the matching *ResourceBarrier key in OptiScaler.ini)",
+                         kResNames[ch]);
+        }
+
+        if (_audioEnabled)
+            StartAudio(sessionDir);
 
         WriteManifest();
     }
@@ -652,6 +1016,8 @@ class CaptureEngine
             std::lock_guard<std::mutex> lock(_stateMutex);
             _lastMessage = reason;
         }
+
+        StopAudio();
 
         LOG_INFO("[Capture] session stopping: {}", reason);
         WriteManifest();
@@ -839,7 +1205,7 @@ class CaptureEngine
 
         if (source == nullptr)
         {
-            // Exposure 常为 null，属正常情况
+            // 该输入这一帧没提供（NGX 允许 optional 输入缺省），跳过不算错误
             target.skipped = true;
             target.skipReason = "null";
             return false;
@@ -1124,7 +1490,8 @@ class CaptureEngine
             frameBytes += written;
 
             frameJson[prefix + "_present"] = true;
-            frameJson[prefix + "_format"] = FormatName(onDiskFormat);
+            frameJson[prefix + "_format"] =
+                onDiskFormat == kOnDiskRgb8 ? kOnDiskRgb8Name : FormatName(onDiskFormat);
             frameJson[prefix + "_format_value"] = static_cast<int>(onDiskFormat);
             frameJson[prefix + "_source_format"] = FormatName(target.format);
             frameJson[prefix + "_row_pitch"] = target.rowPitch;
@@ -1148,9 +1515,9 @@ class CaptureEngine
         _bytesWritten.fetch_add(frameBytes, std::memory_order_relaxed);
     }
 
-    // 把回读缓冲按 tight 行写盘。index 决定通道的压缩策略（Compact=true 且源为 RGBA16F 时）：
+    // 把回读缓冲按 tight 行写盘。Compact=true 时按通道压缩：
     //   · motion → 只写 RG 两通道（DXGI_FORMAT_R16G16_FLOAT，4 B/px），无损
-    //   · color  → 打包成 DXGI_FORMAT_R11G11B10_FLOAT（4 B/px），保留 HDR
+    //   · color  → 8-bit RGB（3 B/px，Reinhard+gamma 已烘焙；host 喂模型的就是这个值）
     // 其余情况原样写出。onDiskFormat / onDiskStride 回报实际落盘格式，写进 frame.json。
     bool WriteReadbackRows(int index, const ReadbackTarget& target, const std::filesystem::path& path,
                            UINT64& written, DXGI_FORMAT& onDiskFormat, UINT& onDiskStride)
@@ -1179,9 +1546,10 @@ class CaptureEngine
         const bool compact = _compact.load(std::memory_order_relaxed);
         const bool srcRGBA16 = target.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         const bool compactMotion = compact && srcRGBA16 && index == RES_MOTION;
-        const bool compactColor = compact && srcRGBA16 && index == RES_COLOR;
+        // color：Compact 时一律落 8-bit RGB（3 B/px），与离线 host 喂模型的值逐位一致
+        const bool rgb8Color = compact && index == RES_COLOR && Rgb8SourceSupported(target.format);
 
-        if (compactMotion || compactColor)
+        if (compactMotion)
         {
             // 源是 RGBA16F：8 B/px，故每行像素数 = tight / 8
             const size_t pixelsPerRow = static_cast<size_t>(tight) / 8u;
@@ -1189,18 +1557,11 @@ class CaptureEngine
 
             for (UINT row = 0; row < target.rowCount; ++row)
             {
-                const auto* src = reinterpret_cast<const uint16_t*>(base + static_cast<UINT64>(row) * target.rowPitch);
+                const auto* src =
+                    reinterpret_cast<const uint16_t*>(base + static_cast<UINT64>(row) * target.rowPitch);
 
-                if (compactMotion)
-                {
-                    for (size_t x = 0; x < pixelsPerRow; ++x)
-                        line[x] = static_cast<uint32_t>(src[x * 4 + 0]) | (static_cast<uint32_t>(src[x * 4 + 1]) << 16);
-                }
-                else
-                {
-                    for (size_t x = 0; x < pixelsPerRow; ++x)
-                        line[x] = PackR11G11B10(&src[x * 4]);
-                }
+                for (size_t x = 0; x < pixelsPerRow; ++x)
+                    line[x] = static_cast<uint32_t>(src[x * 4 + 0]) | (static_cast<uint32_t>(src[x * 4 + 1]) << 16);
 
                 out.write(reinterpret_cast<const char*>(line.data()),
                           static_cast<std::streamsize>(pixelsPerRow * sizeof(uint32_t)));
@@ -1212,7 +1573,32 @@ class CaptureEngine
             target.buffer->Unmap(0, &noWrite);
 
             onDiskStride = static_cast<UINT>(pixelsPerRow * sizeof(uint32_t));
-            onDiskFormat = compactMotion ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R11G11B10_FLOAT;
+            onDiskFormat = DXGI_FORMAT_R16G16_FLOAT;
+            written = static_cast<UINT64>(target.rowCount) * onDiskStride;
+            return true;
+        }
+
+        if (rgb8Color)
+        {
+            const UINT srcBpp = Rgb8SourceBpp(target.format);
+            const size_t pixelsPerRow = srcBpp > 0 ? static_cast<size_t>(tight) / srcBpp : 0;
+            std::vector<uint8_t> line(pixelsPerRow * 3u);
+
+            for (UINT row = 0; row < target.rowCount; ++row)
+            {
+                PackRowRgb8(base + static_cast<UINT64>(row) * target.rowPitch, pixelsPerRow, target.format,
+                            line.data());
+                out.write(reinterpret_cast<const char*>(line.data()),
+                          static_cast<std::streamsize>(pixelsPerRow * 3u));
+            }
+
+            out.close();
+
+            const D3D12_RANGE noWrite = { 0, 0 };
+            target.buffer->Unmap(0, &noWrite);
+
+            onDiskStride = static_cast<UINT>(pixelsPerRow * 3u);
+            onDiskFormat = kOnDiskRgb8;
             written = static_cast<UINT64>(target.rowCount) * onDiskStride;
             return true;
         }
@@ -1239,8 +1625,9 @@ class CaptureEngine
         std::filesystem::path sessionDir;
 
         nlohmann::json manifest;
-        // 2 = Compact 落盘契约（*_format 记落盘格式，*_source_format 记源格式）
-        manifest["capture_version"] = 2;
+        // 3 = color 落盘 8-bit RGB（3 B/px，Reinhard+gamma 已在采集端烘焙）+ motion RG16F
+        //     （2 = 旧的 R11G11B10 契约，host 仍能读；1 = Compact 之前）
+        manifest["capture_version"] = 3;
 
         {
             std::lock_guard<std::mutex> lock(_stateMutex);
@@ -1265,11 +1652,21 @@ class CaptureEngine
         manifest["max_frames"] = _maxFrames.load();
         manifest["captured_frames"] = _capturedFrames.load();
         manifest["dropped_frames"] = _droppedFrames.load();
+        // 0 = NGX 每帧都给了 FrameTimeDeltaInMsec（host 的时间轴才有依据）
+        manifest["frames_without_frame_time"] = _framesWithoutTime.load();
         manifest["bytes_written"] = _bytesWritten.load();
         manifest["capturing"] = _capturing.load();
+        if (_audio != nullptr && _audio->ok.load())
+        {
+            manifest["audio_file"] = "audio.wav";
+            manifest["audio_format"] = _audio->formatName;
+            manifest["audio_sample_rate"] = _audio->sampleRate.load();
+            manifest["audio_channels"] = _audio->channels.load();
+            manifest["audio_frames"] = _audio->frames.load();
+        }
         manifest["motion_direction"] = "current_to_previous";
         manifest["motion_units"] = "pixels";
-        manifest["frame_layout"] = "frame_%06d/{color,depth,motion,exposure}.bin + frame.json";
+        manifest["frame_layout"] = "frame_%06d/{color,motion}.bin + frame.json";
 
         std::ofstream out(sessionDir / "manifest.json", std::ios::binary | std::ios::trunc);
         if (out.is_open())
@@ -1345,6 +1742,8 @@ class CaptureEngine
         value = 0.0f;
         slot.frameTimeMs =
             params->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &value) == NVSDK_NGX_Result_Success ? value : 0.0f;
+        if (!(slot.frameTimeMs > 0.0f))
+            _framesWithoutTime.fetch_add(1, std::memory_order_relaxed);
     }
 
     void ReleaseSlotResources(Slot& slot)
@@ -1381,12 +1780,14 @@ class CaptureEngine
     // =============================================================================
     bool _enabled = false;
     std::atomic<bool> _compact { true };
-    bool _channelEnabled[kResCount] = { true, true, true, false };
+    bool _channelEnabled[kResCount] = { true, true };
 
     std::atomic<int> _frameStride { 2 };
     std::atomic<long> _maxFrames { 0 };
 
     std::filesystem::path _rootDir;
+    std::filesystem::path _outputDir; // 会话输出目录（默认 = _rootDir）
+    std::string _outputDirConfig;     // [Capture] OutputDir 的原始值
     std::filesystem::path _sessionDir;
     std::string _sessionStartedUtc;
 
@@ -1407,6 +1808,7 @@ class CaptureEngine
 
     std::atomic<long> _capturedFrames { 0 };
     std::atomic<long> _droppedFrames { 0 };
+    std::atomic<long> _framesWithoutTime { 0 }; // frameTimeMs 为 0 的帧数（NGX 没给帧时长）
     std::atomic<long> _inFlight { 0 };
     std::atomic<UINT64> _bytesWritten { 0 };
     std::atomic<UINT64> _markerCounter { 0 };
@@ -1421,6 +1823,11 @@ class CaptureEngine
     std::set<int> _barrierWarned;
 
     std::thread _worker;
+
+    // 音频（WASAPI 环回）：由 worker 线程起停；音频线程只经裸指针访问 _audio
+    std::unique_ptr<AudioCapture> _audio;
+    std::thread _audioThread;
+    bool _audioEnabled = false;
 };
 } // namespace
 

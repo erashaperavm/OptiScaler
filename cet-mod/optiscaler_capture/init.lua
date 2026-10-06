@@ -31,8 +31,8 @@
 --      OptiCaptureToggle() / OptiCaptureStart() / OptiCaptureStop() / ...
 --   E) 完全不用 CET：直接在通信目录手写 command.txt（START / STOP / STATUS）
 --
--- ── 单次录制上限（本脚本强制）─────────────────────────────────────────────
---   最长 5 分钟，或落盘 50 GiB，先到先停（自动发 STOP）。
+-- ── 单次录制上限（本脚本强制，0 = 该项不限制）─────────────────────────────
+--   默认只按体积：落盘满 75 GiB 自动停止（时间不限）。
 --
 -- ── 关于「控制台命令」──────────────────────────────────────────────────────
 -- CET 并没有 registerConsoleCommand 这类 API。控制台本质上只是一个 Lua REPL：
@@ -58,9 +58,9 @@
 local commandFile = "command.txt"
 local statusFile  = "status.json"
 
--- ── 单次录制上限 ───────────────────────────────────────────────────────────
-local MAX_SECONDS = 300                              -- 5 分钟
-local MAX_BYTES   = 50 * 1024 * 1024 * 1024          -- 50 GiB
+-- ── 单次录制上限（任一为 0 表示该项不限制）──────────────────────────────────
+local MAX_SECONDS = 0                                -- 时间不限
+local MAX_BYTES   = 100 * 1024 * 1024 * 1024         -- 100 GiB
 
 -- ── HUD 文案 ───────────────────────────────────────────────────────────────
 -- CET 自带 fonts/NotoSansSC-Regular.otf（简体中文），HUD 可直接显示中文。
@@ -233,12 +233,12 @@ local function updateCaptureState(dt)
         st.elapsed = st.elapsed + dt
 
         if not st.limitHit then
-            if st.elapsed >= MAX_SECONDS then
+            if MAX_SECONDS > 0 and st.elapsed >= MAX_SECONDS then
                 st.limitHit = true
                 st.limitMessage = string.format("已达 %.0f 分钟上限，自动停止", MAX_SECONDS / 60.0)
                 sendCommand("STOP")
                 print("[OptiScaler Capture] " .. st.limitMessage)
-            elseif st.bytes >= MAX_BYTES then
+            elseif MAX_BYTES > 0 and st.bytes >= MAX_BYTES then
                 st.limitHit = true
                 st.limitMessage = string.format("已达 %.0f GB 上限，自动停止", MAX_BYTES / (1024.0 * 1024.0 * 1024.0))
                 sendCommand("STOP")
@@ -529,8 +529,15 @@ pcall(function() consoleExposed = exposeToConsole() end)
 
 registerForEvent("onInit", function()
     print("[OptiScaler Capture] CET 端已加载。")
-    print(string.format("[OptiScaler Capture] HUD 常驻屏幕顶端；Page Up 开始/结束；单次上限 %d 分钟 / %.0f GB",
-        MAX_SECONDS / 60, MAX_BYTES / (1024.0 * 1024.0 * 1024.0)))
+    local limitText = "无限制"
+    if MAX_SECONDS > 0 and MAX_BYTES > 0 then
+        limitText = string.format("%d 分钟或 %.0f GB，先到先停", MAX_SECONDS / 60, MAX_BYTES / (1024.0 * 1024.0 * 1024.0))
+    elseif MAX_SECONDS > 0 then
+        limitText = string.format("%d 分钟", MAX_SECONDS / 60)
+    elseif MAX_BYTES > 0 then
+        limitText = string.format("%.0f GB", MAX_BYTES / (1024.0 * 1024.0 * 1024.0))
+    end
+    print("[OptiScaler Capture] HUD 常驻屏幕顶端；Page Up 开始/结束；单次上限 " .. limitText)
     if consoleExposed then
         print("[OptiScaler Capture] 控制台可用（记得带括号）：OptiCaptureToggle() / OptiCaptureStart() / OptiCaptureStop() / OptiCaptureStatus() / OptiCaptureWatch()")
     else
