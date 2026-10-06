@@ -375,9 +375,29 @@ struct AudioCapture
     std::string formatName;
 };
 
-// 写 44 字节标准 WAV 头（dataBytes 先给 0 占位，结束时用真实大小重写）。
-void WriteWavHeader(std::ostream& os, int rate, int channels, int bits, bool isFloat, uint32_t dataBytes)
+// WAV 头固定 44 字节：RIFF/WAVE + 16 字节 fmt + data。
+//
+// 这里刻意【不用 std::ostream::write】写头，而是拼进一个 44 字节数组后一次写出：
+// 逐字段 write() 会把头拆成十几次系统调用，一旦中间被信号/失败打断、或调用方在
+// 非零位置调用它，就会在头中间留下空洞——之前正是如此（audioFormat 位置上出现了
+// 0x8F22 这样的非头数据，其后字段整体错位，ffmpeg 报 "wav header size < 14"）。
+// 一次 write 保证头要么完整落盘、要么一个字节都没有。
+//
+// 同时：调用方必须保证流位置是 0（第一次写、以及结束时回填）。
+void WriteWavHeader(std::ostream& os, int rate, int channels, int bits, bool isFloat, uint64_t dataBytes64)
 {
+    // classic WAV 用 32 位长度字段；超过 4 GiB-36 的部分必须钳位，否则 riffSize 会回绕，
+    // 头里出现一个比真实数据小得多的长度（播放器要么截断、要么直接拒绝）。
+    constexpr uint64_t kMaxData = 0xFFFFFFFFull - 36ull;
+    if (dataBytes64 > kMaxData)
+    {
+        LOG_ERROR("[Capture] audio: WAV 数据达 {} 字节，超出 classic RIFF 的 4 GiB 上限，"
+                  "头部长度按上限写入（末尾音频将不可播放）",
+                  dataBytes64);
+        dataBytes64 = kMaxData;
+    }
+    const uint32_t dataBytes = static_cast<uint32_t>(dataBytes64);
+
     const uint16_t blockAlign = static_cast<uint16_t>(channels * bits / 8);
     const uint32_t byteRate = static_cast<uint32_t>(rate) * blockAlign;
     const uint16_t fmtTag = isFloat ? 3 : 1; // 3 = IEEE_FLOAT, 1 = PCM
@@ -387,19 +407,22 @@ void WriteWavHeader(std::ostream& os, int rate, int channels, int bits, bool isF
     const uint32_t sr = static_cast<uint32_t>(rate);
     const uint16_t bps = static_cast<uint16_t>(bits);
 
-    os.write("RIFF", 4);
-    os.write(reinterpret_cast<const char*>(&riffSize), 4);
-    os.write("WAVE", 4);
-    os.write("fmt ", 4);
-    os.write(reinterpret_cast<const char*>(&fmtSize), 4);
-    os.write(reinterpret_cast<const char*>(&fmtTag), 2);
-    os.write(reinterpret_cast<const char*>(&ch), 2);
-    os.write(reinterpret_cast<const char*>(&sr), 4);
-    os.write(reinterpret_cast<const char*>(&byteRate), 4);
-    os.write(reinterpret_cast<const char*>(&blockAlign), 2);
-    os.write(reinterpret_cast<const char*>(&bps), 2);
-    os.write("data", 4);
-    os.write(reinterpret_cast<const char*>(&dataBytes), 4);
+    uint8_t hdr[44] = {};
+    std::memcpy(hdr + 0, "RIFF", 4);
+    std::memcpy(hdr + 4, &riffSize, 4);
+    std::memcpy(hdr + 8, "WAVE", 4);
+    std::memcpy(hdr + 12, "fmt ", 4);
+    std::memcpy(hdr + 16, &fmtSize, 4);
+    std::memcpy(hdr + 20, &fmtTag, 2);
+    std::memcpy(hdr + 22, &ch, 2);
+    std::memcpy(hdr + 24, &sr, 4);
+    std::memcpy(hdr + 28, &byteRate, 4);
+    std::memcpy(hdr + 32, &blockAlign, 2);
+    std::memcpy(hdr + 34, &bps, 2);
+    std::memcpy(hdr + 36, "data", 4);
+    std::memcpy(hdr + 40, &dataBytes, 4);
+
+    os.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
 }
 
 void AudioCaptureThread(AudioCapture* cap)
@@ -522,7 +545,9 @@ void AudioCaptureThread(AudioCapture* cap)
     LOG_INFO("[Capture] audio: 开始录音 {} Hz / {} ch / {} -> {}", rate, channels, cap->formatName,
              WideToUtf8(cap->wavPath.wstring()));
 
-    uint32_t dataBytes = 0;
+    // uint64_t：48 kHz / 2ch / float32 是 384 kB/s，classic WAV 的 uint32 长度上限
+    // (4 GiB) 约 3 小时就会撞上。这里全程用 64 位累加，只在写头时钳位并告警。
+    uint64_t dataBytes = 0;
     std::vector<char> zeros(static_cast<size_t>(mix->nBlockAlign) * 1024u, 0);
 
     while (!cap->stop.load(std::memory_order_relaxed))
@@ -556,7 +581,7 @@ void AudioCaptureThread(AudioCapture* cap)
                 {
                     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
                 }
-                dataBytes += static_cast<uint32_t>(bytes);
+                dataBytes += static_cast<uint64_t>(bytes);
                 cap->frames.fetch_add(frames, std::memory_order_relaxed);
             }
 
@@ -568,15 +593,30 @@ void AudioCaptureThread(AudioCapture* cap)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    out.flush();
     out.close();
 
-    // 用真实数据量重写文件头
+    // 用真实数据量重写文件头。
+    //
+    // 必须显式 seekg 到 0 再写：std::fstream 以 in|out 打开时，读写位置是两个独立的
+    // 指针，仅靠"刚打开"来假设位置为 0 是不可靠的（它取决于实现与前置操作）。之前
+    // 这里没有 seek，头被写到了非零偏移，于是前 20 字节还留着旧的 0 占位、第 20 字节
+    // 起被真实值覆盖出了 0x8F22 这种交错——头整体对不上，ffmpeg 直接判为非法 WAV。
+    // 写完 seekp 回文件末尾，避免 fstream 析构时把写指针位置当作截断依据。
     {
         std::fstream fix(cap->wavPath, std::ios::binary | std::ios::in | std::ios::out);
         if (fix.is_open())
         {
+            fix.seekp(0, std::ios::beg);
             WriteWavHeader(fix, rate, channels, bits, isFloat, dataBytes);
+            fix.flush();
+            fix.seekp(0, std::ios::end);
             fix.close();
+        }
+        else
+        {
+            LOG_ERROR("[Capture] audio: 无法回填 WAV 头（{}），该文件的 RIFF/data 长度会是 0",
+                      WideToUtf8(cap->wavPath.wstring()));
         }
     }
 
