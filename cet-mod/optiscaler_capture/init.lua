@@ -41,11 +41,22 @@
 --                          registerInput，且 init.lua 跑完就置 nil
 --   · LuaSandbox.cpp   —— 每个 mod 独立沙箱，控制台是独立的 sandbox 0
 -- 所以「裸敲 OptiCaptureStatus」在 CET 里永远是语法错误，必须带括号。
+--
+-- ── 兼容性（重要）─────────────────────────────────────────────────────────
+-- CET 的 Lua 运行时是 5.2（其全局白名单里含 bit32 可为证）。以下 5.3+ 才有的
+-- 语法在本文件里会**直接导致语法错误、整个 mod 加载失败**，务必避免：
+--   · 位运算符  |  &  ~  <<  >>      → 用 bit32.bor/band/bxor/lshift/rshift 代替
+--   · 整除运算符  //                 → 用 math.floor(a / b)
+-- 组合 ImGui flag 请用上面的 OR()（内部走 bit32.bor，退化为加法）。
 -- ============================================================================
 
-local captureDir  = "plugins/cyber_engine_tweaks/mods/optiscaler_capture/"
-local commandFile = captureDir .. "command.txt"
-local statusFile  = captureDir .. "status.json"
+-- ⚠️ CET 沙箱的 io 把「相对路径」解析到**本 mod 自己的目录**，且只允许访问该目录树
+-- （绝对路径、`..\` 逃逸一律拒绝）。而 OptiScaler 也正是把 command.txt / status.json
+-- 写在本 mod 目录里，所以这里用相对 mod 根目录的**短文件名**即可。
+-- 若写成 plugins/cyber_engine_tweaks/mods/optiscaler_capture/command.txt，会被解析成
+-- mod 目录下的嵌套子路径（目录不存在）→ io.open 返回 nil，表现为"无法写入 command.txt"。
+local commandFile = "command.txt"
+local statusFile  = "status.json"
 
 -- ── 单次录制上限 ───────────────────────────────────────────────────────────
 local MAX_SECONDS = 300                              -- 5 分钟
@@ -69,6 +80,8 @@ local WATCH_INTERVAL = 5.0
 local hudVisible = true
 local hudErrorLogged = false
 local hudFlagsCache = nil
+local hudProbeDone = false
+local fps = 0.0
 
 -- 从 status.json 读到的捕获状态
 local st = {
@@ -93,8 +106,8 @@ local POLL_INTERVAL = 0.25
 local function sendCommand(cmd)
     local f = io.open(commandFile, "w")
     if not f then
-        print("[OptiScaler Capture] 无法写入 " .. commandFile ..
-              " — 请确认 OptiScaler.ini 的 [Capture] Enabled=true")
+        print("[OptiScaler Capture] io.open 失败: " .. commandFile ..
+              "（CET 沙箱只允许访问本 mod 目录；也可能是 OptiScaler 未启用 [Capture] Enabled）")
         return false
     end
     f:write(cmd)
@@ -283,15 +296,17 @@ end
 -- ---------------------------------------------------------------------------
 -- ImGui HUD
 -- ---------------------------------------------------------------------------
--- 兼容两种枚举表示：数值（可直接 |）或 sol 枚举对象（已重载 |）。都失败时退回 +。
+-- 组合两个 ImGui flag。注意：CET 的 Lua 是 5.2，没有位运算符（| 是 5.3+ 语法，
+-- 在 5.2 里会直接语法报错、整个 mod 加载失败），所以这里用 bit32.bor，退化为加法。
+-- ImGui 各 flag 互不重叠，加法等价于按位或。
 local function OR(a, b)
     if a == nil then return b end
     if b == nil then return a end
-    local ok, v = pcall(function() return a | b end)
-    if ok and v ~= nil then return v end
-    local ok2, v2 = pcall(function() return a + b end)
-    if ok2 and v2 ~= nil then return v2 end
-    return a
+    if bit32 ~= nil and bit32.bor ~= nil then
+        local ok, v = pcall(bit32.bor, a, b)
+        if ok and v ~= nil then return v end
+    end
+    return a + b
 end
 
 local function getHudFlags()
@@ -346,25 +361,63 @@ local function pushStyleVarSafe(idx, a, b)
     if ok then pushedStyleVars = pushedStyleVars + 1 end
 end
 
+-- 官方 wiki 用的是散装数字形式（SetNextWindowPos(x, y, cond)），优先它，ImVec2 兜底。
 local function setNextWindowPosSafe(x, y, px, py)
-    if not pcall(function() ImGui.SetNextWindowPos(ImVec2(x, y), ImGuiCond.Always, ImVec2(px, py)) end) then
-        pcall(function() ImGui.SetNextWindowPos(x, y, ImGuiCond.Always, px, py) end)
+    if not pcall(function() ImGui.SetNextWindowPos(x, y, ImGuiCond.Always, px, py) end) then
+        pcall(function() ImGui.SetNextWindowPos(ImVec2(x, y), ImGuiCond.Always, ImVec2(px, py)) end)
     end
 end
 
+local function setNextWindowSizeSafe(w, h)
+    if not pcall(function() ImGui.SetNextWindowSize(w, h, ImGuiCond.Always) end) then
+        pcall(function() ImGui.SetNextWindowSize(ImVec2(w, h), ImGuiCond.Always) end)
+    end
+end
+
+-- 屏幕宽度：优先用 CET 自带的 GetDisplayResolution()（白名单里确有它）；
+-- ImGui.GetIO().DisplaySize 作为兜底——CET 的 sol_ImGui 不一定绑定 GetIO。
+local function getDisplayWidth()
+    if GetDisplayResolution ~= nil then
+        local ok, w = pcall(GetDisplayResolution)
+        if ok and type(w) == "number" and w > 0 then
+            return w
+        end
+    end
+    if ImGui ~= nil and ImGui.GetIO ~= nil then
+        local ok, w = pcall(function()
+            return ImGui.GetIO().DisplaySize.x
+        end)
+        if ok and type(w) == "number" and w > 0 then
+            return w
+        end
+    end
+    return nil
+end
+
 local function drawHud()
-    if ImGui == nil or ImGui.GetIO == nil then
+    if ImGui == nil or ImGui.Begin == nil then
         return
     end
 
-    local io = ImGui.GetIO()
-    if io == nil or io.DisplaySize == nil then
-        return
+    -- 一次性探测：把可用的 API 打到日志，便于排障
+    if not hudProbeDone then
+        hudProbeDone = true
+        print(string.format(
+            "[OptiScaler Capture] HUD 探测: GetDisplayResolution=%s GetIO=%s Begin=%s ImGuiWindowFlags=%s",
+            tostring(GetDisplayResolution ~= nil),
+            tostring(ImGui.GetIO ~= nil),
+            tostring(ImGui.Begin ~= nil),
+            tostring(ImGuiWindowFlags ~= nil)))
     end
-    local displayW = io.DisplaySize.x or 1920.0
 
-    -- 中轴线顶端，距顶 60 px；pivot=(0.5,0) 让窗口水平居中
-    setNextWindowPosSafe(displayW * 0.5, 60.0, 0.5, 0.0)
+    local displayW = getDisplayWidth()
+    if displayW ~= nil then
+        -- 中轴线顶端，距顶 60 px；pivot=(0.5,0) 水平居中
+        setNextWindowPosSafe(displayW * 0.5, 60.0, 0.5, 0.0)
+    else
+        setNextWindowPosSafe(100.0, 100.0, 0.0, 0.0) -- 拿不到分辨率时的兜底位置
+    end
+    setNextWindowSizeSafe(230.0, 0.0) -- 固定宽度、高度自适应
 
     -- 鲜绿色底、黑字
     pushedStyleColors = 0
@@ -375,26 +428,33 @@ local function drawHud()
     pushStyleVarSafe(ImGuiStyleVar.WindowRounding, 6.0)
     pushStyleVarSafe(ImGuiStyleVar.WindowBorderSize, 0.0)
 
-    ImGui.Begin("##opti_capture_hud", getHudFlags())
-
-    local label
-    if st.state == "capturing" then
-        label = TEXT.capturing
-    elseif st.everCaptured then
-        label = TEXT.ended
-    else
-        label = TEXT.idle
+    -- Begin：先试带 flags（去标题栏/边框），失败退回最简形式（官方 wiki 保证可用）。
+    -- 只有 Begin 成功才配对调用 End，避免 ImGui 断言。
+    local began = pcall(ImGui.Begin, "##opti_capture_hud", getHudFlags())
+    if not began then
+        began = pcall(ImGui.Begin, "##opti_capture_hud")
     end
 
-    ImGui.Text(string.format("%s   %.1f s", label, st.elapsed))
-    ImGui.Text(string.format("%d frames · %s", st.frames, formatBytes(st.bytes)))
-    if st.limitMessage ~= nil then
-        ImGui.Text(st.limitMessage)
-    elseif not st.online then
-        ImGui.Text("status.json 未就绪")
-    end
+    if began then
+        local label
+        if st.state == "capturing" then
+            label = TEXT.capturing
+        elseif st.everCaptured then
+            label = TEXT.ended
+        else
+            label = TEXT.idle
+        end
 
-    ImGui.End()
+        ImGui.Text(string.format("%s   %.1f s", label, st.elapsed))
+        ImGui.Text(string.format("%.0f FPS · %d 帧 · %s", fps, st.frames, formatBytes(st.bytes)))
+        if st.limitMessage ~= nil then
+            ImGui.Text(st.limitMessage)
+        elseif not st.online then
+            ImGui.Text("status.json 未就绪")
+        end
+
+        ImGui.End()
+    end
 
     if pushedStyleVars > 0 then
         ImGui.PopStyleVar(pushedStyleVars)
@@ -483,6 +543,10 @@ end)
 -- ---------------------------------------------------------------------------
 registerForEvent("onUpdate", function(deltaTime)
     local dt = deltaTime or 0.0
+    if dt > 0 then
+        local inst = 1.0 / dt
+        fps = (fps <= 0) and inst or (fps * 0.9 + inst * 0.1) -- 指数平滑
+    end
     updateCaptureState(dt)
 
     if watchEnabled then
